@@ -113,8 +113,13 @@ def main() -> None:
         "--batch-id",
         help="Optional batch_id to reuse across uploads",
     )
-    # --- Integrate_results ---
+    upload_parser.add_argument(
+        "--api-key",
+        help="API key for authenticating to the ingestion API "
+             "(or set SDP_API_KEY env var)",
+    )
 
+    # --- NEW: integrate-results ---
     integrate_parser = subparsers.add_parser(
         "integrate-results",
         help="Fetch results for a batch and join with local raw CSV on a key column",
@@ -154,7 +159,11 @@ def main() -> None:
         "--ca-bundle",
         help="Path to custom CA bundle to verify TLS",
     )
-
+    integrate_parser.add_argument(
+        "--api-key",
+        help="API key for authenticating to the Results API "
+             "(or set SDP_API_KEY env var)",
+    )
 
     # --- Parse & dispatch ---
     args = parser.parse_args()
@@ -199,9 +208,11 @@ def main() -> None:
             server_url=args.server_url,
             batch_id=args.batch_id,
             verify_tls=verify,
+            api_key=args.api_key,
         )
         print("Server response:")
         print(result)
+
     elif args.command == "integrate-results":
         # Decide TLS verification behavior
         if args.ca_bundle:
@@ -216,6 +227,7 @@ def main() -> None:
             batch_id=args.batch_id,
             server_url=args.server_url,
             verify_tls=verify,
+            api_key=args.api_key,
         )
 
         # 2) Join with local raw CSV (with PII)

@@ -1,4 +1,6 @@
-from fastapi import Depends, FastAPI, HTTPException
+import os
+
+from fastapi import Depends, FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List, Optional
@@ -15,6 +17,26 @@ from app.models.token_vault import (
 )
 
 app = FastAPI(title="SDP Ingestion API", version="0.1.0")
+
+API_KEY_ENV_NAME = "SDP_API_KEY"
+
+
+def get_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
+    """
+    Simple API key auth using header X-API-Key.
+    If SDP_API_KEY is not set on the server, auth is effectively disabled
+    (dev mode). In production, SDP_API_KEY must be set.
+    """
+    expected = os.getenv(API_KEY_ENV_NAME)
+
+    # If no API key configured, allow all (DEV mode)
+    if not expected:
+        return None
+
+    if not x_api_key or x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    return x_api_key
 
 
 # ---------- Database setup ----------
@@ -122,6 +144,7 @@ class ProcessResponse(BaseModel):
 def process_batch(
     payload: ProcessRequest,
     db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key),
 ) -> ProcessResponse:
     # If no batch_id provided, create one
     batch_id = payload.batch_id or uuid4()
@@ -243,6 +266,7 @@ class ResultsResponse(BaseModel):
 def get_results(
     batch_id: UUID,
     db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key),
 ) -> ResultsResponse:
     batch = (
         db.query(ProcessingBatch)
