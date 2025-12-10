@@ -4,6 +4,8 @@ from pathlib import Path
 from .tokenization import tokenize_csv, tokenize_csv_with_config
 from .config import load_tokenization_config
 from .transfer import upload_batch
+from .results_client import fetch_results
+from .integration import integrate_results_with_raw_csv
 
 
 def main() -> None:
@@ -111,6 +113,48 @@ def main() -> None:
         "--batch-id",
         help="Optional batch_id to reuse across uploads",
     )
+    # --- Integrate_results ---
+
+    integrate_parser = subparsers.add_parser(
+        "integrate-results",
+        help="Fetch results for a batch and join with local raw CSV on a key column",
+    )
+    integrate_parser.add_argument(
+        "--batch-id",
+        required=True,
+        help="Batch ID to fetch results for",
+    )
+    integrate_parser.add_argument(
+        "--raw-input",
+        "-i",
+        required=True,
+        help="Path to raw input CSV with PII (stays local)",
+    )
+    integrate_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="Path to output CSV with results merged",
+    )
+    integrate_parser.add_argument(
+        "--key-column",
+        default="customer_id",
+        help="Column name to join on (default: customer_id)",
+    )
+    integrate_parser.add_argument(
+        "--server-url",
+        help="Base URL of ingestion/results API (default: http://localhost:8081)",
+    )
+    integrate_parser.add_argument(
+        "--insecure-skip-verify",
+        action="store_true",
+        help="Skip TLS certificate verification (DEV ONLY; NOT for production!)",
+    )
+    integrate_parser.add_argument(
+        "--ca-bundle",
+        help="Path to custom CA bundle to verify TLS",
+    )
+
 
     # --- Parse & dispatch ---
     args = parser.parse_args()
@@ -158,6 +202,31 @@ def main() -> None:
         )
         print("Server response:")
         print(result)
+    elif args.command == "integrate-results":
+        # Decide TLS verification behavior
+        if args.ca_bundle:
+            verify = args.ca_bundle          # use custom CA bundle
+        elif args.insecure_skip_verify:
+            verify = False                   # dev only; don't use in prod
+        else:
+            verify = True                    # normal TLS verification
+
+        # 1) Fetch results from server
+        results = fetch_results(
+            batch_id=args.batch_id,
+            server_url=args.server_url,
+            verify_tls=verify,
+        )
+
+        # 2) Join with local raw CSV (with PII)
+        integrate_results_with_raw_csv(
+            raw_input_path=args.raw_input,
+            output_path=args.output,
+            results=results,
+            key_column=args.key_column,
+        )
+
+        print(f"Integrated results written to: {Path(args.output).resolve()}")
 
     else:
         parser.print_help()
