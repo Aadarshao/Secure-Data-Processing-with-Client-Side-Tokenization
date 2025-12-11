@@ -26,48 +26,29 @@ Data is tokenized locally, uploaded securely, processed server-side, and finally
 
 ### System Architecture
 
+```mermaid
+flowchart TD
+    A["Raw CSV (PII)"]
+    B["Local Tokenization"]
+    C["Tokenized CSV"]
+    D["Secure Upload"]
+    E["Ingestion API"]
+    F["Token Vault"]
+    G["Processing Engine"]
+    H["Results API"]
+    I["Local Reintegration"]
 
-                   ┌────────────────────────┐
-                   │   Raw CSV with PII     │
-                   └─────────────┬──────────┘
-                                 │
-                                 ▼
-                 ┌──────────────────────────────┐
-                 │  Local Tokenization Engine   │
-                 └─────────────┬────────────────┘
-                               │
-                               ▼
-                 ┌──────────────────────────┐
-                 │ Tokenized CSV (Non-PII)  │
-                 └─────────────┬────────────┘
-                               │
-                               ▼
-        ┌────────────────────────────────────────────┐
-        │ Secure Upload Client (HTTPS + API Key)     │
-        └───────────────────┬────────────────────────┘
-                            │
-                            ▼
-                 ┌────────────────────────┐
-                 │ Ingestion API (FastAPI)│
-                 └─────────────┬──────────┘
-                               │
-                ┌──────────────┴──────────────┐
-                ▼                               ▼
-┌────────────────────────┐          ┌────────────────────────────────────┐
-│ Postgres Token Vault   │          │ Dev Processing Engine              │
-│ + Batch Storage        │          │ (Dummy ML Model)                   │
-└─────────────┬──────────┘          └────────────────────┬──────────────┘
-              │                                          │
-              │                                          ▼
-              │                         ┌────────────────────────┐
-              │                         │      Results API       │
-              │                         └─────────────┬──────────┘
-              │                                       │
-              │                                       ▼
-              │                         ┌──────────────────────────────┐
-              └────────────────────────▶│ Local Reintegration          │
-                                        │ Join scores with raw CSV     │
-                                        └──────────────────────────────┘
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    E --> G
+    G --> H
+    H --> I
+
+```
+
 
 
 
