@@ -10,8 +10,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -43,22 +42,29 @@ class ProcessingBatch(Base):
         onupdate=utcnow,
     )
 
+    # Tokens produced for this batch (not strictly required for demo)
     token_records = relationship("TokenVault", back_populates="batch")
 
-class TokenizedRecord(Base):
-    __tablename__ = "tokenized_records"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    batch_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("processing_batches.batch_id"),
-        nullable=False,
-        index=True,
+    # Tokenized records stored as JSONB (input to analytics)
+    tokenized_records = relationship(
+        "TokenizedRecord",
+        back_populates="batch",
+        cascade="all, delete-orphan",
     )
-    payload = Column(JSONB, nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
-    batch = relationship("ProcessingBatch")
+    # Processed results (output of analytics)
+    processed_results = relationship(
+        "ProcessedResult",
+        back_populates="batch",
+        cascade="all, delete-orphan",
+    )
+
+    # Audit events for this batch
+    audit_events = relationship(
+        "BatchAuditEvent",
+        back_populates="batch",
+        cascade="all, delete-orphan",
+    )
 
 
 class TokenVault(Base):
@@ -87,7 +93,34 @@ class TokenVault(Base):
     )
     batch = relationship("ProcessingBatch", back_populates="token_records")
 
+
+class TokenizedRecord(Base):
+    """
+    Stores the tokenized, non-PII payload that is sent to the analytics pipeline.
+    """
+    __tablename__ = "tokenized_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    batch_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("processing_batches.batch_id"),
+        nullable=False,
+        index=True,
+    )
+
+    # Arbitrary JSON payload (e.g. tokenized CSV row)
+    payload = Column(JSONB, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    batch = relationship("ProcessingBatch", back_populates="tokenized_records")
+
+
 class ProcessedResult(Base):
+    """
+    Stores the analytics results (e.g. risk_score) for each record in a batch.
+    """
     __tablename__ = "processed_results"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -99,13 +132,41 @@ class ProcessedResult(Base):
         index=True,
     )
 
-    # e.g. primary key / business key to link back to row
+    # Optional logical key (e.g. customer_id)
     record_key = Column(String(255), nullable=True)
 
-    # Model output only (no raw PII)
+    # Demo: store risk_score as a string
     risk_score = Column(String(50), nullable=False)
-    model_version = Column(String(50), nullable=False, default="demo_v1")
+
+    model_version = Column(String(50), nullable=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
-    batch = relationship("ProcessingBatch")
+    batch = relationship("ProcessingBatch", back_populates="processed_results")
+
+
+class BatchAuditEvent(Base):
+    """
+    Simple audit log for each batch event (ingest, process, results fetch, etc.).
+    """
+    __tablename__ = "batch_audit_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    batch_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("processing_batches.batch_id"),
+        nullable=False,
+        index=True,
+    )
+    client_id = Column(String(100), nullable=False)
+
+    # e.g. "INGEST_RECEIVED", "BATCH_PROCESSED", "RESULTS_FETCHED"
+    event_type = Column(String(100), nullable=False)
+
+    # Arbitrary JSON details (counts, model_version, etc.)
+    details = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    batch = relationship("ProcessingBatch", back_populates="audit_events")
