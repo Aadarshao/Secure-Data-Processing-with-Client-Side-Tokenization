@@ -1,3 +1,14 @@
+███████╗██████╗ ██████╗ 
+██╔════╝██╔══██╗██╔══██╗
+█████╗  ██████╔╝██║  ██║
+██╔══╝  ██╔══██╗██║  ██║
+███████╗██║  ██║██████╔╝
+╚══════╝╚═╝  ╚═╝╚═════╝  
+**SECURE DATA PIPELINE (SDP)**
+
+---
+
+
 # Secure Data Pipeline (SDP)
 
 ## 🎯 Overview
@@ -18,11 +29,11 @@ Data is tokenized locally, uploaded securely, processed server-side, and finally
 
 ## 🛠️ End-to-End Workflow
 
-1.  End-to-End Tokenization
-2.  Secure Upload
-3.  Server Ingestion
-4.  Analytics
-5.  Local Reintegration
+1.  End-to-End Tokenization  
+2.  Secure Upload  
+3.  Server Ingestion  
+4.  Analytics  
+5.  Local Reintegration  
 
 ### System Architecture
 
@@ -38,20 +49,15 @@ flowchart TD
     H --> I[Local Reintegration - Join scores with raw CSV]
 ```
 
+---
 
-
-
------
-
-## 1\. Client Components
+## 1. Client Components
 
 **Location:** `client/sdp_client/`
 
 ### 1.1 Tokenization
 
 #### A. Tokenize via Command Line
-
-Tokenize a CSV by specifying a single column:
 
 ```bash
 python -m sdp_client.cli tokenize-csv \
@@ -63,8 +69,6 @@ python -m sdp_client.cli tokenize-csv \
 
 #### B. Tokenize via YAML Config
 
-Define all tokenization rules in a YAML file (e.g., `configs/customers_tokenization.yml`).
-
 ```bash
 python -m sdp_client.cli tokenize-config \
   --config configs/customers_tokenization.yml \
@@ -74,11 +78,9 @@ python -m sdp_client.cli tokenize-config \
 
 **Functionality:**
 
-  * Generates a tokenized non-PII CSV.
-  * Stores encrypted originals in a local SQLite vault: `token_vault.db`.
-  * Uses **AES-GCM** with your crypto key:
-
-<!-- end list -->
+* Generates a tokenized non-PII CSV  
+* Stores encrypted originals in a local SQLite vault: `token_vault.db`  
+* Uses **AES-GCM** with your crypto key  
 
 ```bash
 # Example for Windows (PowerShell)
@@ -87,14 +89,13 @@ $env:SDP_CRYPTO_KEY = "Miql-SH11OTpm4rFOh5QF7iNG2fPolSwwvvb1YceREw="
 
 ### 1.2 Upload Batch to Server
 
-Set your API key (required):
+Set API key:
 
 ```bash
-# Example for Windows (PowerShell)
 $env:SDP_API_KEY = "dev-secret-api-key"
 ```
 
-Upload a batch:
+Upload:
 
 ```bash
 python -m sdp_client.cli upload-batch \
@@ -104,7 +105,7 @@ python -m sdp_client.cli upload-batch \
   --server-url http://localhost:8081
 ```
 
-**Example Server Response:**
+Example server response:
 
 ```json
 {
@@ -116,8 +117,6 @@ python -m sdp_client.cli upload-batch \
 
 ### 1.3 Dev Processing (Simulated ML Scoring)
 
-Trigger server-side processing:
-
 ```powershell
 $batchId = "YOUR-BATCH-ID"
 
@@ -127,7 +126,7 @@ Invoke-WebRequest `
   Select-Object -ExpandProperty Content
 ```
 
-**Expected Output:**
+Output:
 
 ```json
 {
@@ -138,9 +137,7 @@ Invoke-WebRequest `
 }
 ```
 
-### 1.4 Retrieve & Integrate Results with Raw CSV
-
-Retrieve and merge scores locally:
+### 1.4 Retrieve & Integrate Results
 
 ```bash
 python -m sdp_client.cli integrate-results \
@@ -151,128 +148,96 @@ python -m sdp_client.cli integrate-results \
   --server-url http://localhost:8081
 ```
 
-**Result:** `customers_with_scores.csv` containing:
+---
 
-  * Raw customer data
-  * Model risk scores
-  * Model version metadata
-
------
-
-## 2\. Server Components
+## 2. Server Components
 
 **Location:** `server/ingestion_api/`
 
 ### 2.1 Technologies
 
 | Technology | Role |
-| :--- | :--- |
-| **FastAPI** | REST API framework. |
-| **PostgreSQL** | Token vault + batch metadata persistence. |
-| **SQLAlchemy ORM** | Database interaction layer. |
-| **AES-GCM** | Encryption for original values in the vault. |
-| **API Key Auth** | Authentication via `X-API-Key` header. |
-| **Docker** | Containerization environment. |
+|-----------|------|
+| FastAPI | REST API |
+| PostgreSQL | Token vault & metadata |
+| SQLAlchemy | ORM |
+| AES-GCM | Encryption |
+| API Key Auth | Security |
+| Docker | Deployment |
 
-### 2.2 Key Endpoints
+### 2.2 Endpoints
 
 | Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/api/v1/process` | `POST` | Upload a batch of tokenized records. |
-| `/dev/process-batch/{batch_id}` | `POST` | Dev-only simulated ML scoring trigger. |
-| `/api/v1/results/{batch_id}` | `GET` | Return processed scores for a batch. |
-| `/health` | `GET` | Simple service health probe. |
+|---------|--------|-------------|
+| `/api/v1/process` | POST | Upload batch |
+| `/dev/process-batch/{batch_id}` | POST | Dev scoring |
+| `/api/v1/results/{batch_id}` | GET | Retrieve results |
+| `/health` | GET | Health check |
 
------
+---
 
-## 3\. Docker Infrastructure
-
-**Location:** `infra/docker-compose.yml`
-
-### Starting the Full Stack
+## 3. Docker Infrastructure
 
 ```bash
 docker compose up -d
 ```
 
-### Health Check
+Health check:
 
 ```bash
 curl http://localhost:8081/health
 ```
 
-**Expected:**
+---
 
-```json
-{"status":"ok","service":"ingestion_api"}
-```
-
------
-
-## 4\. Environment Variables
+## 4. Environment Variables
 
 | Variable | Scope | Description |
-| :--- | :--- | :--- |
-| `SDP_CRYPTO_KEY` | client + server | AES-GCM encryption key. |
-| `SDP_API_KEY` | client + server | API key (header `X-API-Key`). |
-| `DB_DSN` | server | PostgreSQL DSN. |
-| `SDP_ENV` | server | Environment mode (`dev`). |
+|----------|--------|-------------|
+| `SDP_CRYPTO_KEY` | client/server | AES-GCM |
+| `SDP_API_KEY` | client/server | API Key |
+| `DB_DSN` | server | PostgreSQL DSN |
+| `SDP_ENV` | server | Environment (dev) |
 
------
+---
 
-## 5\. Database Schema
+## 5. Database Schema
 
-**Tables:**
+* `token_vault`  
+* `processing_batch`  
+* `tokenized_record`  
+* `processed_result`  
 
-  * `token_vault` – Encrypted originals + tokens.
-  * `processing_batch` – Tracking client uploads.
-  * `tokenized_record` – Each uploaded tokenized row.
-  * `processed_result` – Scoring results.
+---
 
------
-
-## 6\. End-to-End Example (Full Pipeline)
+## 6. Full Pipeline Example
 
 ```bash
-# 1) Tokenize
-python -m sdp_client.cli tokenize-config --config configs/customers_tokenization.yml ...
-
-# 2) Upload tokenized CSV
+python -m sdp_client.cli tokenize-config ...
 python -m sdp_client.cli upload-batch ...
-
-# 3) Process (dev)
 Invoke-WebRequest -Uri http://localhost:8081/dev/process-batch/<batchId> -Method POST
-
-# 4) Integrate results with raw PII
 python -m sdp_client.cli integrate-results ...
 ```
 
-**Result:**
+---
 
-  * Raw PII stays local
-  * Tokenized data processed securely
-  * Scores merged locally
+## 7. Current Status
 
------
+* Deterministic tokenization  
+* AES-GCM vault  
+* TLS upload client  
+* Ingestion API  
+* Dummy scoring engine  
+* Full working pipeline  
 
-## 7\. Current Status
+---
 
-This implementation currently provides:
+## 8. Future Roadmap
 
-  * Local deterministic & config-driven tokenization
-  * AES-GCM encrypted token vault
-  * Upload client with TLS support
-  * Server ingestion API
-  * Dev-only ML simulator
-  * End-to-end tested integration
+* Production ingestion workers  
+* mTLS  
+* Advanced ML scoring  
+* Real-time ingestion  
+* Admin dashboard  
+* Key rotation tools  
 
------
-
-## 8\. Future Roadmap
-
-  * Production ingestion workers 
-  * mTLS between client ↔ server
-  * Advanced ML scoring pipeline
-  * Stream/real-time ingestion
-  * Admin dashboard for batches
-  * Secure key rotation tools
