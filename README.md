@@ -30,13 +30,15 @@ Data is tokenized locally, uploaded securely, processed server-side, and finally
 flowchart TD
     A[Raw CSV with PII] --> B[Local Tokenization Engine]
     B --> C[Tokenized CSV (Non-PII)]
-    C --> D[Secure Upload Client<br>(HTTPS + API Key)]
+    C --> D[Secure Upload Client (HTTPS + API Key)]
     D --> E[Ingestion API (FastAPI)]
     E --> F[Postgres Token Vault + Batches]
-    E --> G[Dev Processing Engine<br>(Dummy ML Model)]
+    E --> G[Dev Processing Engine (Dummy ML Model)]
     G --> H[Results API]
-    H --> I[Local Reintegration<br>Join scores with raw CSV]
+    H --> I[Local Reintegration - Join scores with raw CSV]
 ```
+
+
 
 
 -----
