@@ -28,16 +28,15 @@ Data is tokenized locally, uploaded securely, processed server-side, and finally
 
 ```mermaid
 flowchart TD
-A[Raw CSV with PII] --> B[Local Tokenization Engine]
-B --> C[Tokenized CSV (Non-PII)]
-C --> D[Secure Upload Client<br>(HTTPS + API Key)]
-D --> E[Ingestion API (FastAPI)]
-E --> F[Postgres Token Vault + Batches]
-E --> G[Dev Processing Engine<br>(Dummy ML Model)]
-G --> H[Results API]
-H --> I[Local Reintegration<br>Join scores with raw CSV]
+    A[Raw CSV with PII] --> B[Local Tokenization Engine]
+    B --> C(Tokenized CSV (Non-PII))
+    C --> D[Secure Upload Client<br>(HTTPS + API Key)]
+    D --> E[Ingestion API (FastAPI)]
+    E --> F{Postgres Token Vault + Batches}
+    E --> G[Dev Processing Engine<br>(Dummy ML Model)]
+    G --> H[Results API]
+    H --> I[Local Reintegration<br>Join scores with raw CSV]
 ```
-I will reformat your complete README content, ensuring the Markdown structure is flawless for rendering on GitHub (using `###` for sub-sections, clear code blocks, and tables) and embedding a relevant diagram tag for visual clarity.
 
 
 -----
