@@ -24,18 +24,35 @@ def fetch_results(
     base_url = server_url or os.getenv("SDP_SERVER_URL", "http://localhost:8081")
     endpoint = f"{base_url.rstrip('/')}/api/v1/results/{batch_id}"
 
-    # Build headers
     headers: Dict[str, str] = {}
-
     resolved_api_key = api_key or os.getenv("SDP_API_KEY")
     if resolved_api_key:
         headers["X-API-Key"] = resolved_api_key
 
-    resp = requests.get(
-        endpoint,
-        headers=headers,
-        timeout=30,
-        verify=verify_tls,
-    )
+    try:
+        resp = requests.get(
+            endpoint,
+            headers=headers,
+            timeout=30,
+            verify=verify_tls,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Failed to connect to results API at {endpoint}: {e}"
+        ) from e
+
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "Unauthorized (401) calling results API. "
+            "Check SDP_API_KEY or --api-key matches the server's SDP_API_KEY."
+        )
+
+    if resp.status_code == 404:
+        raise RuntimeError(
+            f"Batch {batch_id} not found on server. "
+            "Make sure it was uploaded and processed first."
+        )
+
     resp.raise_for_status()
     return resp.json()
+

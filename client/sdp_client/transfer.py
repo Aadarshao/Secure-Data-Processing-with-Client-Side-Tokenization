@@ -33,7 +33,7 @@ def upload_batch(
     Upload a tokenized CSV as JSON to the ingestion API.
 
     server_url: base URL such as
-      - http://localhost:8081         (dev, no TLS)
+      - http://localhost:8081        (dev, no TLS)
       - https://ingestion.example.com (prod, TLS)
 
     verify_tls:
@@ -42,7 +42,7 @@ def upload_batch(
       - "path/to/ca.pem" -> verify against custom CA file
 
     api_key:
-      - explicit string passed by caller; if None, will fall back to SDP_API_KEY env var.
+      - Optional. If not provided, will read from SDP_API_KEY env variable.
     """
     base_url = server_url or os.getenv("SDP_SERVER_URL", "http://localhost:8081")
     endpoint = f"{base_url.rstrip('/')}/api/v1/process"
@@ -57,7 +57,6 @@ def upload_batch(
     if batch_id:
         payload["batch_id"] = batch_id
 
-    # Build headers, including API key if available
     headers: Dict[str, str] = {
         "Content-Type": "application/json",
     }
@@ -66,12 +65,26 @@ def upload_batch(
     if resolved_api_key:
         headers["X-API-Key"] = resolved_api_key
 
-    response = requests.post(
-        endpoint,
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=30,
-        verify=verify_tls,
-    )
+    try:
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=30,
+            verify=verify_tls,
+        )
+    except requests.RequestException as e:
+        # Network / connection level error
+        raise RuntimeError(
+            f"Failed to connect to ingestion API at {endpoint}: {e}"
+        ) from e
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Unauthorized (401) calling ingestion API. "
+            "Check SDP_API_KEY or --api-key matches the server's SDP_API_KEY."
+        )
+
     response.raise_for_status()
     return response.json()
+
