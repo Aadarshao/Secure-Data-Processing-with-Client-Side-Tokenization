@@ -1,10 +1,10 @@
 import os
+from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import Any, Dict, List, Optional
-from uuid import UUID, uuid4
 
 from app.database import Base, SessionLocal, engine
 from app.core.crypto import decrypt_value, encrypt_value
@@ -16,37 +16,24 @@ from app.models.token_vault import (
     ProcessedResult,
 )
 
+# --------------------------------------------------------------------
+# FastAPI app
+# --------------------------------------------------------------------
 app = FastAPI(title="SDP Ingestion API", version="0.1.0")
 
-API_KEY_ENV_NAME = "SDP_API_KEY"
+# Single API key for now (Phase 5 could move this to DB/tenant model)
+API_KEY = os.getenv("SDP_API_KEY")
+ENV = os.getenv("SDP_ENV", "dev").lower()
 
 
-def get_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
-    """
-    Simple API key auth using header X-API-Key.
-    If SDP_API_KEY is not set on the server, auth is effectively disabled
-    (dev mode). In production, SDP_API_KEY must be set.
-    """
-    expected = os.getenv(API_KEY_ENV_NAME)
-
-    # If no API key configured, allow all (DEV mode)
-    if not expected:
-        return None
-
-    if not x_api_key or x_api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-    return x_api_key
-
-
-# ---------- Database setup ----------
-
-
+# --------------------------------------------------------------------
+# Database setup
+# --------------------------------------------------------------------
 @app.on_event("startup")
 def on_startup() -> None:
     """
     For dev: auto-create tables if they don't exist.
-    In production, we'll replace this with Alembic migrations.
+    In production, use Alembic migrations.
     """
     Base.metadata.create_all(bind=engine)
 
@@ -59,18 +46,50 @@ def get_db() -> Session:
         db.close()
 
 
-# ---------- Health ----------
+# --------------------------------------------------------------------
+# Auth / security dependencies
+# --------------------------------------------------------------------
+def verify_api_key(x_api_key: str = Header(default=None, alias="X-API-Key")) -> None:
+    """
+    Require X-API-Key header to match SDP_API_KEY env var (if set).
+    If SDP_API_KEY is not set, treat as misconfigured and deny access.
+    """
+    if not API_KEY:
+        # Misconfigured server – better to fail closed
+        raise HTTPException(
+            status_code=500,
+            detail="Server API key not configured",
+        )
+
+    if x_api_key is None or x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+        )
 
 
+def dev_only() -> None:
+    """
+    Allow access only when SDP_ENV=dev.
+    Used to guard /dev/* endpoints so they never run in prod.
+    """
+    if ENV != "dev":
+        # Don't leak that such endpoints exist
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+# --------------------------------------------------------------------
+# Health
+# --------------------------------------------------------------------
 @app.get("/health")
-def health_check() -> dict:
+def health_check() -> Dict[str, str]:
+    # Intentionally open, no auth required.
     return {"status": "ok", "service": "ingestion_api"}
 
 
-# ---------- Dev-only Token Vault endpoints ----------
-
-
-
+# --------------------------------------------------------------------
+# Dev-only Token Vault endpoints (guarded by dev_only)
+# --------------------------------------------------------------------
 class TokenVaultCreate(BaseModel):
     original_value: str
     token_value: str
@@ -79,10 +98,11 @@ class TokenVaultCreate(BaseModel):
     source_column: str
 
 
-@app.post("/dev/token-vault", response_model=dict)
+@app.post("/dev/token-vault", response_model=Dict[str, str], dependencies=[Depends(dev_only)])
 def create_token_record(
-    payload: TokenVaultCreate, db: Session = Depends(get_db)
-) -> dict:
+    payload: TokenVaultCreate,
+    db: Session = Depends(get_db),
+) -> Dict[str, str]:
     encrypted = encrypt_value(payload.original_value)
 
     record = TokenVault(
@@ -99,8 +119,11 @@ def create_token_record(
     return {"token_id": str(record.token_id)}
 
 
-@app.get("/dev/token-vault/{token_value}", response_model=dict)
-def get_original_by_token(token_value: str, db: Session = Depends(get_db)) -> dict:
+@app.get("/dev/token-vault/{token_value}", response_model=Dict[str, Any], dependencies=[Depends(dev_only)])
+def get_original_by_token(
+    token_value: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     record = (
         db.query(TokenVault)
         .filter(TokenVault.token_value == token_value)
@@ -120,13 +143,11 @@ def get_original_by_token(token_value: str, db: Session = Depends(get_db)) -> di
         "source_table": record.source_table,
         "source_column": record.source_column,
     }
-# ---------- Ingestion API: /api/v1/process ----------
 
 
-class TokenizedRecordIn(BaseModel):
-    data: Dict[str, Any]
-
-
+# --------------------------------------------------------------------
+# Ingestion API: /api/v1/process  (auth required)
+# --------------------------------------------------------------------
 class ProcessRequest(BaseModel):
     client_id: str
     processing_type: str
@@ -140,17 +161,24 @@ class ProcessResponse(BaseModel):
     status: str = "ACCEPTED"
 
 
-@app.post("/api/v1/process", response_model=ProcessResponse)
+@app.post(
+    "/api/v1/process",
+    response_model=ProcessResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 def process_batch(
     payload: ProcessRequest,
     db: Session = Depends(get_db),
-    api_key: str = Depends(get_api_key),
 ) -> ProcessResponse:
     # If no batch_id provided, create one
     batch_id = payload.batch_id or uuid4()
 
     # Upsert ProcessingBatch
-    batch = db.query(ProcessingBatch).filter(ProcessingBatch.batch_id == batch_id).first()
+    batch = (
+        db.query(ProcessingBatch)
+        .filter(ProcessingBatch.batch_id == batch_id)
+        .first()
+    )
     if batch is None:
         batch = ProcessingBatch(
             batch_id=batch_id,
@@ -181,9 +209,10 @@ def process_batch(
         status="RECEIVED",
     )
 
-# ---------- Dev-only processing: simulate analytics on tokenized data ----------
 
-
+# --------------------------------------------------------------------
+# Dev-only processing: simulate analytics on tokenized data
+# --------------------------------------------------------------------
 class DevProcessResponse(BaseModel):
     batch_id: UUID
     processed_records: int
@@ -191,7 +220,11 @@ class DevProcessResponse(BaseModel):
     status: str = "PROCESSED"
 
 
-@app.post("/dev/process-batch/{batch_id}", response_model=DevProcessResponse)
+@app.post(
+    "/dev/process-batch/{batch_id}",
+    response_model=DevProcessResponse,
+    dependencies=[Depends(dev_only)],
+)
 def dev_process_batch(
     batch_id: UUID,
     db: Session = Depends(get_db),
@@ -224,7 +257,11 @@ def dev_process_batch(
         risk_score_value = str(min(len(email_token), 99))
 
         # Optional record_key: use customer_id if present
-        record_key = str(payload.get("customer_id")) if "customer_id" in payload else None
+        record_key = (
+            str(payload.get("customer_id"))
+            if "customer_id" in payload
+            else None
+        )
 
         db.add(
             ProcessedResult(
@@ -247,9 +284,10 @@ def dev_process_batch(
         status="PROCESSED",
     )
 
-# ---------- Results API: fetch processed results by batch_id ----------
 
-
+# --------------------------------------------------------------------
+# Results API: fetch processed results by batch_id  (auth required)
+# --------------------------------------------------------------------
 class ResultRecord(BaseModel):
     record_key: Optional[str]
     risk_score: str
@@ -262,11 +300,14 @@ class ResultsResponse(BaseModel):
     records: List[ResultRecord]
 
 
-@app.get("/api/v1/results/{batch_id}", response_model=ResultsResponse)
+@app.get(
+    "/api/v1/results/{batch_id}",
+    response_model=ResultsResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 def get_results(
     batch_id: UUID,
     db: Session = Depends(get_db),
-    api_key: str = Depends(get_api_key),
 ) -> ResultsResponse:
     batch = (
         db.query(ProcessingBatch)
