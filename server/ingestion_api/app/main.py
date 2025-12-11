@@ -1,10 +1,12 @@
-import os
 import logging
-from typing import Any, Dict, List, Optional
+import os
+import time
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Header
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.database import Base, SessionLocal, engine
@@ -15,33 +17,116 @@ from app.models.token_vault import (
     ProcessingBatch,
     TokenizedRecord,
     ProcessedResult,
-    BatchAuditEvent,
 )
 
-# ---------- Logging setup ----------
+# -----------------------------------------------------------------------------
+# App + Logging setup
+# -----------------------------------------------------------------------------
 
-LOG_LEVEL = os.getenv("SDP_LOG_LEVEL", "INFO").upper()
+app = FastAPI(title="SDP Ingestion API", version="0.1.0")
+
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("ingestion_api")
 
 
-# ---------- FastAPI app ----------
+def log_event(event: str, **fields: Any) -> None:
+    """
+    Small helper for structured log-style messages.
+    Example:
+      log_event("batch_received", client_id="bank_demo", batch_id="...", records=3)
+    """
+    extras = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("%s %s", event, extras)
 
-app = FastAPI(title="SDP Ingestion API", version="0.1.0")
+
+# -----------------------------------------------------------------------------
+# API key auth
+# -----------------------------------------------------------------------------
+
+API_KEY = os.getenv("SDP_API_KEY")
 
 
-# ---------- Database setup ----------
+def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
+    """
+    Simple header-based API key check.
+    - Expects header: X-API-Key: <API_KEY>
+    """
+    if not API_KEY:
+        # If no API key configured, we accept whatever is given (dev convenience)
+        return x_api_key
+
+    if x_api_key != API_KEY:
+        log_event("invalid_api_key", provided_key=x_api_key)
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return x_api_key
+
+
+# -----------------------------------------------------------------------------
+# Simple in-memory per-client rate limiter (stub)
+# -----------------------------------------------------------------------------
+
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("SDP_RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("SDP_RATE_LIMIT_MAX_REQUESTS", "60"))
+
+# Keyed by (client_id, scope) -> deque[timestamps]
+RateLimitKey = Tuple[str, str]
+_rate_limit_buckets: Dict[RateLimitKey, Deque[float]] = defaultdict(deque)
+
+
+def enforce_rate_limit(client_id: str, scope: str) -> None:
+    """
+    Very simple in-memory rate limit stub, per client_id + scope.
+    Not distributed and not persistent – good enough for this demo.
+    """
+    if not client_id:
+        # If somehow empty, don't rate-limit (but log)
+        log_event("rate_limit_missing_client_id", scope=scope)
+        return
+
+    now = time.time()
+    key: RateLimitKey = (client_id, scope)
+    bucket = _rate_limit_buckets[key]
+
+    # Drop timestamps outside the window
+    while bucket and (now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS):
+        bucket.popleft()
+
+    if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+        log_event(
+            "rate_limit_exceeded",
+            client_id=client_id,
+            scope=scope,
+            window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+            max_requests=RATE_LIMIT_MAX_REQUESTS,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded for this client. Please slow down.",
+        )
+
+    bucket.append(now)
+
+
+# -----------------------------------------------------------------------------
+# Database setup
+# -----------------------------------------------------------------------------
 
 @app.on_event("startup")
 def on_startup() -> None:
     """
     For dev: auto-create tables if they don't exist.
-    In production, use Alembic migrations instead.
+    In production, we'll replace this with Alembic migrations.
     """
     Base.metadata.create_all(bind=engine)
+    log_event(
+        "startup",
+        rate_limit_window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+        rate_limit_max_requests=RATE_LIMIT_MAX_REQUESTS,
+    )
 
 
 def get_db() -> Session:
@@ -52,59 +137,18 @@ def get_db() -> Session:
         db.close()
 
 
-# ---------- API key auth (simple) ----------
-
-API_KEY_ENV = os.getenv("SDP_API_KEY")
-
-
-def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
-    """
-    Simple header-based API key check.
-
-    - If SDP_API_KEY is not set, auth is effectively disabled (dev mode).
-    - If SDP_API_KEY is set, require X-API-Key header to match.
-    """
-    if API_KEY_ENV is None:
-        # No API key configured -> allow all (dev mode)
-        return
-
-    if x_api_key is None or x_api_key != API_KEY_ENV:
-        logger.warning("invalid_api_key x_api_key_provided=%s", bool(x_api_key))
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-# ---------- Audit helper ----------
-
-def record_audit_event(
-    db: Session,
-    batch: ProcessingBatch,
-    event_type: str,
-    details: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Store an audit event for this batch/client.
-
-    NOTE: this function commits its own row. In a more advanced setup you might
-    want to share the transaction with the caller and commit once.
-    """
-    audit = BatchAuditEvent(
-        batch_id=batch.batch_id,
-        client_id=batch.client_id,
-        event_type=event_type,
-        details=details or {},
-    )
-    db.add(audit)
-    db.commit()
-
-
-# ---------- Health ----------
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
 
 @app.get("/health")
 def health_check() -> dict:
     return {"status": "ok", "service": "ingestion_api"}
 
 
-# ---------- Dev-only Token Vault endpoints ----------
+# -----------------------------------------------------------------------------
+# Dev-only Token Vault endpoints
+# -----------------------------------------------------------------------------
 
 class TokenVaultCreate(BaseModel):
     original_value: str
@@ -132,11 +176,11 @@ def create_token_record(
     db.commit()
     db.refresh(record)
 
-    logger.info(
-        "dev_token_created source_table=%s source_column=%s token_type=%s",
-        payload.source_table,
-        payload.source_column,
-        payload.token_type.value,
+    log_event(
+        "dev_token_created",
+        token_id=str(record.token_id),
+        source_table=record.source_table,
+        source_column=record.source_column,
     )
 
     return {"token_id": str(record.token_id)}
@@ -159,11 +203,11 @@ def get_original_by_token(
 
     original_value = decrypt_value(record.original_value_encrypted)
 
-    logger.info(
-        "dev_token_lookup token_value=%s source_table=%s source_column=%s",
-        token_value,
-        record.source_table,
-        record.source_column,
+    log_event(
+        "dev_token_lookup",
+        token_value=token_value,
+        source_table=record.source_table,
+        source_column=record.source_column,
     )
 
     return {
@@ -175,7 +219,13 @@ def get_original_by_token(
     }
 
 
-# ---------- Ingestion API: /api/v1/process ----------
+# -----------------------------------------------------------------------------
+# Ingestion API: /api/v1/process
+# -----------------------------------------------------------------------------
+
+class TokenizedRecordIn(BaseModel):
+    data: Dict[str, Any]
+
 
 class ProcessRequest(BaseModel):
     client_id: str
@@ -190,15 +240,15 @@ class ProcessResponse(BaseModel):
     status: str = "ACCEPTED"
 
 
-@app.post(
-    "/api/v1/process",
-    response_model=ProcessResponse,
-    dependencies=[Depends(verify_api_key)],
-)
+@app.post("/api/v1/process", response_model=ProcessResponse)
 def process_batch(
     payload: ProcessRequest,
     db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ) -> ProcessResponse:
+    # Rate limit per client for ingestion
+    enforce_rate_limit(payload.client_id, scope="process")
+
     # If no batch_id provided, create one
     batch_id = payload.batch_id or uuid4()
 
@@ -217,6 +267,18 @@ def process_batch(
         )
         db.add(batch)
     else:
+        # Guardrail: ensure client_id isn't silently changed across reuses
+        if batch.client_id != payload.client_id:
+            log_event(
+                "batch_client_mismatch",
+                existing_client_id=batch.client_id,
+                payload_client_id=payload.client_id,
+                batch_id=batch_id,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="client_id does not match existing batch owner",
+            )
         batch.status = "RECEIVED"
 
     # Store each tokenized record as JSONB
@@ -232,23 +294,12 @@ def process_batch(
 
     db.commit()
 
-    # Audit + structured log
-    record_audit_event(
-        db=db,
-        batch=batch,
-        event_type="INGEST_RECEIVED",
-        details={
-            "accepted_records": count,
-            "processing_type": payload.processing_type,
-        },
-    )
-
-    logger.info(
-        "batch_received client_id=%s batch_id=%s processing_type=%s records=%d",
-        payload.client_id,
-        batch_id,
-        payload.processing_type,
-        count,
+    log_event(
+        "batch_received",
+        client_id=payload.client_id,
+        batch_id=str(batch_id),
+        processing_type=payload.processing_type,
+        records=count,
     )
 
     return ProcessResponse(
@@ -258,9 +309,12 @@ def process_batch(
     )
 
 
-# ---------- Dev-only processing: simulate analytics on tokenized data ----------
+# -----------------------------------------------------------------------------
+# Dev-only processing: simulate analytics on tokenized data
+# -----------------------------------------------------------------------------
 
 class DevProcessResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     batch_id: UUID
     processed_records: int
     model_version: str = "demo_v1"
@@ -320,23 +374,12 @@ def dev_process_batch(
     batch.status = "PROCESSED"
     db.commit()
 
-    # Audit + structured log
-    record_audit_event(
-        db=db,
-        batch=batch,
-        event_type="BATCH_PROCESSED",
-        details={
-            "processed_records": processed_count,
-            "model_version": "demo_v1",
-        },
-    )
-
-    logger.info(
-        "batch_processed client_id=%s batch_id=%s processed_records=%d model_version=%s",
-        batch.client_id,
-        batch_id,
-        processed_count,
-        "demo_v1",
+    log_event(
+        "batch_processed",
+        client_id=batch.client_id,
+        batch_id=str(batch_id),
+        processed_records=processed_count,
+        model_version="demo_v1",
     )
 
     return DevProcessResponse(
@@ -347,29 +390,41 @@ def dev_process_batch(
     )
 
 
-# ---------- Results API: fetch processed results by batch_id ----------
+# -----------------------------------------------------------------------------
+# Results API: fetch processed results by batch_id
+# -----------------------------------------------------------------------------
 
 class ResultRecord(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     record_key: Optional[str]
     risk_score: str
     model_version: str
 
 
 class ResultsResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     batch_id: UUID
     status: str
     records: List[ResultRecord]
 
 
-@app.get(
-    "/api/v1/results/{batch_id}",
-    response_model=ResultsResponse,
-    dependencies=[Depends(verify_api_key)],
-)
+@app.get("/api/v1/results/{batch_id}", response_model=ResultsResponse)
 def get_results(
     batch_id: UUID,
+    x_client_id: str = Header(..., alias="X-Client-Id"),
     db: Session = Depends(get_db),
+    _: str = Depends(verify_api_key),
 ) -> ResultsResponse:
+    """
+    Multi-tenant guardrail:
+    - Requires X-Client-Id header.
+    - Ensures that the batch belongs to this client_id.
+    """
+    client_id = x_client_id
+
+    # Rate limit per client for results queries
+    enforce_rate_limit(client_id, scope="results")
+
     batch = (
         db.query(ProcessingBatch)
         .filter(ProcessingBatch.batch_id == batch_id)
@@ -377,6 +432,19 @@ def get_results(
     )
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")
+
+    # Tenant isolation check
+    if batch.client_id != client_id:
+        log_event(
+            "results_forbidden_wrong_client",
+            requested_client_id=client_id,
+            batch_client_id=batch.client_id,
+            batch_id=str(batch_id),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: batch does not belong to this client_id",
+        )
 
     results = (
         db.query(ProcessedResult)
@@ -393,19 +461,11 @@ def get_results(
         for r in results
     ]
 
-    # Audit + structured log
-    record_audit_event(
-        db=db,
-        batch=batch,
-        event_type="RESULTS_FETCHED",
-        details={"records": len(out_records)},
-    )
-
-    logger.info(
-        "results_fetched client_id=%s batch_id=%s records=%d",
-        batch.client_id,
-        batch_id,
-        len(out_records),
+    log_event(
+        "results_fetched",
+        client_id=client_id,
+        batch_id=str(batch_id),
+        records=len(out_records),
     )
 
     return ResultsResponse(

@@ -130,6 +130,11 @@ def main() -> None:
         help="Batch ID to fetch results for",
     )
     integrate_parser.add_argument(
+        "--client-id",
+        required=True,
+        help="Client identifier (must match the one used for upload-batch)",
+    )
+    integrate_parser.add_argument(
         "--raw-input",
         "-i",
         required=True,
@@ -225,6 +230,7 @@ def main() -> None:
         # 1) Fetch results from server
         results = fetch_results(
             batch_id=args.batch_id,
+            client_id=args.client_id,
             server_url=args.server_url,
             verify_tls=verify,
             api_key=args.api_key,

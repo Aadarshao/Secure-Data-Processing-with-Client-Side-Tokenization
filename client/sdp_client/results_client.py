@@ -6,6 +6,7 @@ import requests
 
 def fetch_results(
     batch_id: str,
+    client_id: str,
     server_url: Optional[str] = None,
     verify_tls: bool | str = True,
     api_key: Optional[str] = None,
@@ -20,14 +21,23 @@ def fetch_results(
 
     api_key:
       - Optional. If not provided, will read from SDP_API_KEY env variable.
+
+    client_id:
+      - Logical client identifier (e.g. "bank_demo").
+        Used for multi-tenant scoping and per-client rate limiting.
     """
     base_url = server_url or os.getenv("SDP_SERVER_URL", "http://localhost:8081")
     endpoint = f"{base_url.rstrip('/')}/api/v1/results/{batch_id}"
 
     headers: Dict[str, str] = {}
+
+    # API key for auth
     resolved_api_key = api_key or os.getenv("SDP_API_KEY")
     if resolved_api_key:
         headers["X-API-Key"] = resolved_api_key
+
+    # Required by server for tenant isolation
+    headers["X-Client-Id"] = client_id
 
     try:
         resp = requests.get(
@@ -47,6 +57,13 @@ def fetch_results(
             "Check SDP_API_KEY or --api-key matches the server's SDP_API_KEY."
         )
 
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "Forbidden (403) fetching results. "
+            "The batch does not belong to this client_id. "
+            "Make sure --client-id matches the one used for upload-batch."
+        )
+
     if resp.status_code == 404:
         raise RuntimeError(
             f"Batch {batch_id} not found on server. "
@@ -55,4 +72,3 @@ def fetch_results(
 
     resp.raise_for_status()
     return resp.json()
-
