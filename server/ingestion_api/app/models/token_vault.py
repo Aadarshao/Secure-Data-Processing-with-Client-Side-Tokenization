@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
@@ -42,24 +43,20 @@ class ProcessingBatch(Base):
         onupdate=utcnow,
     )
 
-    # Tokens produced for this batch (not strictly required for demo)
     token_records = relationship("TokenVault", back_populates="batch")
 
-    # Tokenized records stored as JSONB (input to analytics)
     tokenized_records = relationship(
         "TokenizedRecord",
         back_populates="batch",
         cascade="all, delete-orphan",
     )
 
-    # Processed results (output of analytics)
     processed_results = relationship(
         "ProcessedResult",
         back_populates="batch",
         cascade="all, delete-orphan",
     )
 
-    # Audit events for this batch
     audit_events = relationship(
         "BatchAuditEvent",
         back_populates="batch",
@@ -71,15 +68,9 @@ class TokenVault(Base):
     __tablename__ = "token_vault"
 
     token_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    # Encrypted original PII
     original_value_encrypted = Column(Text, nullable=False)
-
-    # Token representing this PII (deterministic for referential integrity)
     token_value = Column(String(255), nullable=False, index=True)
-
     token_type = Column(Enum(TokenTypeEnum), nullable=False)
-
     source_table = Column(String(255), nullable=False)
     source_column = Column(String(255), nullable=False)
 
@@ -96,9 +87,14 @@ class TokenVault(Base):
 
 class TokenizedRecord(Base):
     """
-    Stores the tokenized, non-PII payload that is sent to the analytics pipeline.
+    Stores the tokenized payload sent to analytics pipeline.
+    Idempotency key: (batch_id, record_key)
     """
     __tablename__ = "tokenized_records"
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "record_key", name="uq_tokenized_batch_recordkey"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
@@ -109,9 +105,9 @@ class TokenizedRecord(Base):
         index=True,
     )
 
-    # Arbitrary JSON payload (e.g. tokenized CSV row)
-    payload = Column(JSONB, nullable=False)
+    record_key = Column(String(255), nullable=False, index=True)
 
+    payload = Column(JSONB, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     batch = relationship("ProcessingBatch", back_populates="tokenized_records")
@@ -119,9 +115,14 @@ class TokenizedRecord(Base):
 
 class ProcessedResult(Base):
     """
-    Stores the analytics results (e.g. risk_score) for each record in a batch.
+    Stores analytics results per record in a batch.
+    Idempotency key: (batch_id, record_key)
     """
     __tablename__ = "processed_results"
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "record_key", name="uq_results_batch_recordkey"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
@@ -132,12 +133,9 @@ class ProcessedResult(Base):
         index=True,
     )
 
-    # Optional logical key (e.g. customer_id)
-    record_key = Column(String(255), nullable=True)
+    record_key = Column(String(255), nullable=False, index=True)
 
-    # Demo: store risk_score as a string
     risk_score = Column(String(50), nullable=False)
-
     model_version = Column(String(50), nullable=False)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
@@ -146,9 +144,6 @@ class ProcessedResult(Base):
 
 
 class BatchAuditEvent(Base):
-    """
-    Simple audit log for each batch event (ingest, process, results fetch, etc.).
-    """
     __tablename__ = "batch_audit_events"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -160,11 +155,7 @@ class BatchAuditEvent(Base):
         index=True,
     )
     client_id = Column(String(100), nullable=False)
-
-    # e.g. "INGEST_RECEIVED", "BATCH_PROCESSED", "RESULTS_FETCHED"
     event_type = Column(String(100), nullable=False)
-
-    # Arbitrary JSON details (counts, model_version, etc.)
     details = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)

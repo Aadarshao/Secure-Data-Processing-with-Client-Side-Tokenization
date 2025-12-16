@@ -1,17 +1,17 @@
 import json
 import logging
 import os
-import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import Base, SessionLocal, engine
 from app.core.crypto import decrypt_value, encrypt_value
+from app.core.rate_limit import FixedWindowRateLimiter
+from app.database import Base, SessionLocal, engine
 from app.models.token_vault import (
     TokenTypeEnum,
     TokenVault,
@@ -29,17 +29,61 @@ logger.setLevel(logging.INFO)
 
 if not logger.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | ingestion_api | %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | ingestion_api | %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+# -------------------------
+# Rate Limiter
+# -------------------------
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+RATE_LIMIT_PER_MINUTE = _int_env("SDP_RATE_LIMIT_PER_MINUTE", 60)
+_rate_limiter = FixedWindowRateLimiter(limit=RATE_LIMIT_PER_MINUTE, window_seconds=60)
+
+
+def _rate_limit_or_429(*, client_id: str, action: str) -> None:
+    key = f"{client_id}:{action}"
+    state = _rate_limiter.check(key)
+
+    headers = {
+        "X-RateLimit-Limit": str(state.limit),
+        "X-RateLimit-Remaining": str(state.remaining),
+        "X-RateLimit-Reset": str(state.reset_epoch),
+    }
+
+    if not state.allowed:
+        import time as _t
+        retry_after = max(0, state.reset_epoch - int(_t.time()))
+        headers["Retry-After"] = str(retry_after)
+
+        logger.warning(
+            "rate_limited "
+            f"client_id={client_id} action={action} limit={state.limit} reset_epoch={state.reset_epoch}"
+        )
+
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded",
+            headers=headers,
+        )
+
+    _rate_limiter.maybe_cleanup()
 
 # -------------------------
 # FastAPI app
 # -------------------------
 
-app = FastAPI(title="SDP Ingestion API", version="0.2.0")
+app = FastAPI(title="SDP Ingestion API", version="0.4.1")
 
 # -------------------------
 # Database setup
@@ -47,10 +91,6 @@ app = FastAPI(title="SDP Ingestion API", version="0.2.0")
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """
-    For dev: auto-create tables if they don't exist.
-    In production, replace with Alembic migrations.
-    """
     Base.metadata.create_all(bind=engine)
 
 
@@ -62,43 +102,10 @@ def get_db() -> Session:
         db.close()
 
 # -------------------------
-# Rate limit stub (DEV ONLY)
-# -------------------------
-
-RATE_LIMIT_PER_MINUTE = int(os.getenv("SDP_RATE_LIMIT_PER_MINUTE", "60"))
-_rate_limit_cache: Dict[str, List[float]] = {}
-
-
-def check_rate_limit(client_id: str) -> None:
-    """
-    Simple in-memory rate limit (DEV stub).
-    Not suitable for multi-process or production.
-    """
-    now = time.time()
-    window_seconds = 60.0
-
-    timestamps = _rate_limit_cache.get(client_id, [])
-    timestamps = [t for t in timestamps if (now - t) < window_seconds]
-
-    if len(timestamps) >= RATE_LIMIT_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded for client_id")
-
-    timestamps.append(now)
-    _rate_limit_cache[client_id] = timestamps
-
-# -------------------------
-# Auth / Client Context (Phase 5.1)
+# Auth / Client Context (multi-tenant)
 # -------------------------
 
 def _load_api_key_map() -> Dict[str, str]:
-    """
-    Optional multi-tenant mapping: client_id -> api_key
-
-    Set via env:
-      SDP_API_KEYS_JSON='{"bank_demo":"dev-secret-api-key","bank_abc":"another-key"}'
-
-    If this is set, the API key determines the client_id.
-    """
     raw = os.getenv("SDP_API_KEYS_JSON")
     if not raw:
         return {}
@@ -106,24 +113,12 @@ def _load_api_key_map() -> Dict[str, str]:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             return {}
-        out: Dict[str, str] = {}
-        for k, v in parsed.items():
-            out[str(k)] = str(v)
-        return out
+        return {str(k): str(v) for k, v in parsed.items()}
     except Exception:
         return {}
 
 
 def _resolve_client_for_key(api_key: str) -> Tuple[Optional[str], str]:
-    """
-    Returns (authorized_client_id, mode)
-
-    mode:
-      - "mapped"    -> SDP_API_KEYS_JSON mapping is used; api_key maps to exactly one client_id
-      - "single"    -> SDP_API_KEY used; api_key is valid but not tied to a specific client_id
-      - "invalid"   -> not valid
-    """
-    # 1) Mapped multi-tenant mode (recommended)
     key_map = _load_api_key_map()
     if key_map:
         for client_id, key in key_map.items():
@@ -131,7 +126,6 @@ def _resolve_client_for_key(api_key: str) -> Tuple[Optional[str], str]:
                 return client_id, "mapped"
         return None, "invalid"
 
-    # 2) Single shared key mode (dev/simple)
     single_key = os.getenv("SDP_API_KEY")
     if single_key and api_key == single_key:
         return None, "single"
@@ -142,8 +136,8 @@ def _resolve_client_for_key(api_key: str) -> Tuple[Optional[str], str]:
 class ClientContext(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     api_key: str
-    client_id: Optional[str]  # if mapped mode, will be the resolved client
-    mode: str                 # "mapped" | "single"
+    client_id: Optional[str]
+    mode: str  # "mapped" | "single"
 
 
 def require_client_context(
@@ -166,15 +160,6 @@ def _enforce_client_match(
     batch_client_id: Optional[str],
     action: str,
 ) -> str:
-    """
-    Decide the effective client_id and enforce tenant isolation.
-
-    Rules:
-      - If mapped mode: ctx.client_id is the ONLY allowed client.
-      - If single mode: any client_id is allowed, but we still enforce that
-        the requested client matches the batch's stored client for reads/process actions.
-      - If requested_client_id is missing, fallback to batch_client_id when available.
-    """
     effective_client_id = requested_client_id or batch_client_id
 
     if not effective_client_id:
@@ -183,7 +168,6 @@ def _enforce_client_match(
             detail="client_id is required (provide in body, query, or X-Client-Id header)",
         )
 
-    # If API key is mapped to a specific client_id, enforce it strictly.
     if ctx.mode == "mapped":
         if ctx.client_id != effective_client_id:
             logger.warning(
@@ -192,7 +176,6 @@ def _enforce_client_match(
             )
             raise HTTPException(status_code=401, detail="API key not authorized for this client")
 
-    # Tenant isolation against stored batch.client_id (for actions on an existing batch)
     if batch_client_id and effective_client_id != batch_client_id:
         logger.warning(
             f"tenant_denied action={action} reason=cross_tenant_access "
@@ -201,6 +184,18 @@ def _enforce_client_match(
         raise HTTPException(status_code=403, detail="Forbidden: cross-tenant access")
 
     return effective_client_id
+
+# -------------------------
+# Helpers for idempotency
+# -------------------------
+
+def _extract_record_key(record: Dict[str, Any]) -> str:
+    if "customer_id" in record and record["customer_id"] is not None:
+        return str(record["customer_id"])
+    raise HTTPException(
+        status_code=422,
+        detail="Each record must include customer_id for idempotent ingestion",
+    )
 
 # -------------------------
 # Health
@@ -229,7 +224,6 @@ def create_token_record(
     db: Session = Depends(get_db),
     ctx: ClientContext = Depends(require_client_context),
 ) -> dict:
-    # Dev endpoint: still requires API key
     encrypted = encrypt_value(payload.original_value)
 
     record = TokenVault(
@@ -268,10 +262,7 @@ def get_original_by_token(
 
     original_value = decrypt_value(record.original_value_encrypted)
 
-    logger.info(
-        "token_vault_lookup "
-        f"client_mode={ctx.mode} token_value={token_value}"
-    )
+    logger.info("token_vault_lookup " f"client_mode={ctx.mode} token_value={token_value}")
 
     return {
         "token_value": record.token_value,
@@ -313,12 +304,10 @@ def process_batch(
         action="process_batch",
     )
 
-    # Rate limit (DEV)
-    check_rate_limit(effective_client_id)
+    _rate_limit_or_429(client_id=effective_client_id, action="api_v1_process")
 
     batch_id = payload.batch_id or uuid4()
 
-    # Upsert ProcessingBatch
     batch = db.query(ProcessingBatch).filter(ProcessingBatch.batch_id == batch_id).first()
     if batch is None:
         batch = ProcessingBatch(
@@ -328,8 +317,8 @@ def process_batch(
             status="RECEIVED",
         )
         db.add(batch)
+        db.flush()
     else:
-        # If reusing a batch_id, enforce tenant isolation
         effective_client_id = _enforce_client_match(
             ctx=ctx,
             requested_client_id=effective_client_id,
@@ -339,33 +328,33 @@ def process_batch(
         batch.status = "RECEIVED"
         batch.processing_type = payload.processing_type
 
-    # Store each tokenized record as JSONB
-    count = 0
+    inserted = 0
+    skipped = 0
+
     for record in payload.records:
-        db.add(
-            TokenizedRecord(
-                batch_id=batch_id,
-                payload=record,
-            )
-        )
-        count += 1
+        record_key = _extract_record_key(record)
+
+        try:
+            # ✅ SAVEPOINT: only this record rolls back on conflict
+            with db.begin_nested():
+                db.add(TokenizedRecord(batch_id=batch_id, record_key=record_key, payload=record))
+                db.flush()
+            inserted += 1
+        except IntegrityError:
+            skipped += 1
 
     db.commit()
 
     logger.info(
         "batch_received "
         f"client_id={effective_client_id} batch_id={batch_id} "
-        f"processing_type={payload.processing_type} records={count}"
+        f"processing_type={payload.processing_type} inserted={inserted} skipped={skipped}"
     )
 
-    return ProcessResponse(
-        batch_id=batch_id,
-        accepted_records=count,
-        status="RECEIVED",
-    )
+    return ProcessResponse(batch_id=batch_id, accepted_records=inserted, status="RECEIVED")
 
 # -------------------------
-# Dev-only processing (OPTION A: idempotent)
+# Dev-only processing
 # -------------------------
 
 class DevProcessResponse(BaseModel):
@@ -396,40 +385,34 @@ def dev_process_batch(
         action="dev_process_batch",
     )
 
-    # Rate limit (DEV)
-    check_rate_limit(effective_client_id)
+    _rate_limit_or_429(client_id=effective_client_id, action="dev_process_batch")
 
-    # ✅ OPTION A FIX: make processing idempotent by deleting old results first
-    db.query(ProcessedResult).filter(ProcessedResult.batch_id == batch_id).delete(
-        synchronize_session=False
-    )
-    db.commit()
+    records = db.query(TokenizedRecord).filter(TokenizedRecord.batch_id == batch_id).all()
 
-    records = (
-        db.query(TokenizedRecord)
-        .filter(TokenizedRecord.batch_id == batch_id)
-        .all()
-    )
+    inserted = 0
+    skipped = 0
 
-    processed_count = 0
     for rec in records:
         payload = rec.payload or {}
         email_token = str(payload.get("email", ""))
 
-        # Dummy scoring function: longer token => higher score
         risk_score_value = str(min(len(email_token), 99))
+        record_key = rec.record_key  # stable / idempotent
 
-        record_key = str(payload.get("customer_id")) if "customer_id" in payload else None
-
-        db.add(
-            ProcessedResult(
-                batch_id=batch_id,
-                record_key=record_key,
-                risk_score=risk_score_value,
-                model_version="demo_v1",
-            )
-        )
-        processed_count += 1
+        try:
+            with db.begin_nested():
+                db.add(
+                    ProcessedResult(
+                        batch_id=batch_id,
+                        record_key=record_key,
+                        risk_score=risk_score_value,
+                        model_version="demo_v1",
+                    )
+                )
+                db.flush()
+            inserted += 1
+        except IntegrityError:
+            skipped += 1
 
     batch.status = "PROCESSED"
     db.commit()
@@ -437,23 +420,23 @@ def dev_process_batch(
     logger.info(
         "batch_processed "
         f"client_id={effective_client_id} batch_id={batch_id} "
-        f"processed_records={processed_count} model_version=demo_v1"
+        f"inserted={inserted} skipped={skipped} model_version=demo_v1"
     )
 
     return DevProcessResponse(
         batch_id=batch_id,
-        processed_records=processed_count,
+        processed_records=inserted,
         model_version="demo_v1",
         status="PROCESSED",
     )
 
 # -------------------------
-# Results API: fetch processed results by batch_id
+# Results API
 # -------------------------
 
 class ResultRecord(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
-    record_key: Optional[str]
+    record_key: str
     risk_score: str
     model_version: str
 
@@ -485,21 +468,12 @@ def get_results(
         action="get_results",
     )
 
-    # Rate limit (DEV)
-    check_rate_limit(effective_client_id)
+    _rate_limit_or_429(client_id=effective_client_id, action="api_v1_results")
 
-    results = (
-        db.query(ProcessedResult)
-        .filter(ProcessedResult.batch_id == batch_id)
-        .all()
-    )
+    results = db.query(ProcessedResult).filter(ProcessedResult.batch_id == batch_id).all()
 
     out_records: List[ResultRecord] = [
-        ResultRecord(
-            record_key=r.record_key,
-            risk_score=r.risk_score,
-            model_version=r.model_version,
-        )
+        ResultRecord(record_key=r.record_key, risk_score=r.risk_score, model_version=r.model_version)
         for r in results
     ]
 
@@ -508,8 +482,4 @@ def get_results(
         f"client_id={effective_client_id} batch_id={batch_id} records={len(out_records)}"
     )
 
-    return ResultsResponse(
-        batch_id=batch_id,
-        status=batch.status,
-        records=out_records,
-    )
+    return ResultsResponse(batch_id=batch_id, status=batch.status, records=out_records)
