@@ -22,6 +22,7 @@ services:
     environment:
       SDP_ENV: dev
       DB_DSN: postgresql://sdp:sdp_password@postgres:5432/sdp
+      SDP_RATE_LIMIT_PER_MINUTE: "60"
       SDP_CRYPTO_KEY: "Miql-SH11OTpm4rFOh5QF7iNG2fPolSwwvvb1YceREw="
       SDP_API_KEY: "dev-secret-api-key"
     ports:
