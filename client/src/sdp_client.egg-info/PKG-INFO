@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: sdp-client
-Version: 0.2.0
-Summary: Secure Data Processing client CLI
-Requires-Python: >=3.10
-Description-Content-Type: text/markdown
-Requires-Dist: requests>=2.31
-Requires-Dist: cryptography>=42
-Requires-Dist: pyyaml>=6.0
