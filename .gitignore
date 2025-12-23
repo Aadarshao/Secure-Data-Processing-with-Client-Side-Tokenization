@@ -1,21 +1,30 @@
-# --- Python virtual environments ---
-client/.venv/
-server/.venv/
-.venv/
+# Secrets
+.secrets/
+*.env
+.env
+.env.*
 
-# --- Local databases / vaults (contain or reference PII) ---
-client/token_vault.db
+# Local DB / vault
+token_vault.db
+*.db
 
-# --- Local CSV data files (raw and tokenized) ---
-client/data/*.csv
+# Local data outputs
+data/
+client/data/
 
-# --- Python caches ---
+# Docker / runtime volumes
+infra/postgres/
+
+# Python
 __pycache__/
 *.pyc
-*.pyo
+.venv/
+venv/
 
-# --- VS Code workspace ---
+# OS/editor
+.DS_Store
+Thumbs.db
 .vscode/
 
-# --- Docker volumes or local DB data (if you ever mount them) ---
-infra/postgres_data/
+# Backups
+*.bak
