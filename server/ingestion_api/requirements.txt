@@ -5,3 +5,4 @@ python-dotenv==1.0.1
 pydantic==2.9.2
 SQLAlchemy==2.0.36
 cryptography==43.0.1
+python-multipart>=0.0.9

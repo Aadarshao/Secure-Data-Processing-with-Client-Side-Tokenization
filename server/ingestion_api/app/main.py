@@ -1,10 +1,12 @@
+import csv
+import io
 import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -186,7 +188,7 @@ def _enforce_client_match(
     return effective_client_id
 
 # -------------------------
-# Helpers for idempotency
+# Helpers
 # -------------------------
 
 def _extract_record_key(record: Dict[str, Any]) -> str:
@@ -196,6 +198,24 @@ def _extract_record_key(record: Dict[str, Any]) -> str:
         status_code=422,
         detail="Each record must include customer_id for idempotent ingestion",
     )
+
+
+def _parse_csv_bytes_to_records(csv_bytes: bytes) -> List[Dict[str, Any]]:
+    try:
+        text = csv_bytes.decode("utf-8-sig")
+    except Exception:
+        raise HTTPException(status_code=422, detail="CSV must be UTF-8 encoded")
+
+    f = io.StringIO(text)
+    reader = csv.DictReader(f)
+
+    if not reader.fieldnames:
+        raise HTTPException(status_code=422, detail="CSV is missing a header row")
+
+    if "customer_id" not in reader.fieldnames:
+        raise HTTPException(status_code=422, detail="CSV must include a 'customer_id' column")
+
+    return [dict(row) for row in reader]
 
 # -------------------------
 # Health
@@ -273,7 +293,7 @@ def get_original_by_token(
     }
 
 # -------------------------
-# Ingestion API: /api/v1/process
+# Ingestion API: /api/v1/process (JSON)
 # -------------------------
 
 class ProcessRequest(BaseModel):
@@ -335,7 +355,6 @@ def process_batch(
         record_key = _extract_record_key(record)
 
         try:
-            # ✅ SAVEPOINT: only this record rolls back on conflict
             with db.begin_nested():
                 db.add(TokenizedRecord(batch_id=batch_id, record_key=record_key, payload=record))
                 db.flush()
@@ -352,6 +371,37 @@ def process_batch(
     )
 
     return ProcessResponse(batch_id=batch_id, accepted_records=inserted, status="RECEIVED")
+
+# -------------------------
+# Ingestion API: /api/v1/process-file (multipart CSV)
+# -------------------------
+
+@app.post("/api/v1/process-file", response_model=ProcessResponse)
+async def process_batch_file(
+    client_id: str = Form(...),
+    processing_type: str = Form(...),
+    batch_id: Optional[str] = Form(default=None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    ctx: ClientContext = Depends(require_client_context),
+) -> ProcessResponse:
+    parsed_batch_id: Optional[UUID] = None
+    if batch_id:
+        try:
+            parsed_batch_id = UUID(str(batch_id))
+        except Exception:
+            raise HTTPException(status_code=422, detail="batch_id must be a valid UUID")
+
+    raw = await file.read()
+    records = _parse_csv_bytes_to_records(raw)
+
+    payload = ProcessRequest(
+        client_id=client_id,
+        processing_type=processing_type,
+        batch_id=parsed_batch_id,
+        records=records,
+    )
+    return process_batch(payload=payload, db=db, ctx=ctx)
 
 # -------------------------
 # Dev-only processing
@@ -397,7 +447,7 @@ def dev_process_batch(
         email_token = str(payload.get("email", ""))
 
         risk_score_value = str(min(len(email_token), 99))
-        record_key = rec.record_key  # stable / idempotent
+        record_key = rec.record_key
 
         try:
             with db.begin_nested():
