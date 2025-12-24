@@ -1,12 +1,11 @@
-
 services:
   postgres:
     image: postgres:16
     container_name: sdp_postgres
     environment:
-      POSTGRES_USER: sdp
-      POSTGRES_PASSWORD: sdp_password
-      POSTGRES_DB: sdp
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
     ports:
       - "5432:5432"
     volumes:
@@ -19,12 +18,15 @@ services:
     container_name: sdp_ingestion_api
     depends_on:
       - postgres
+    env_file:
+      - ../.env
     environment:
-      SDP_ENV: dev
-      DB_DSN: postgresql://sdp:sdp_password@postgres:5432/sdp
-      SDP_RATE_LIMIT_PER_MINUTE: "60"
-      SDP_CRYPTO_KEY: "Miql-SH11OTpm4rFOh5QF7iNG2fPolSwwvvb1YceREw="
-      SDP_API_KEY: "dev-secret-api-key"
+      # explicit list so expectations are clear + missing vars fail fast
+      SDP_ENV: ${SDP_ENV:?SDP_ENV is required}
+      DB_DSN: ${DB_DSN:?DB_DSN is required}
+      SDP_RATE_LIMIT_PER_MINUTE: ${SDP_RATE_LIMIT_PER_MINUTE:?SDP_RATE_LIMIT_PER_MINUTE is required}
+      SDP_CRYPTO_KEY: ${SDP_CRYPTO_KEY:?SDP_CRYPTO_KEY is required}
+      SDP_API_KEY: ${SDP_API_KEY:?SDP_API_KEY is required}
     ports:
       - "8081:8080"
     restart: unless-stopped
