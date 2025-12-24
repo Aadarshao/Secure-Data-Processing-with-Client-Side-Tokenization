@@ -10,26 +10,46 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   ingestion_api:
     build:
       context: ../server/ingestion_api
       dockerfile: Dockerfile
     container_name: sdp_ingestion_api
+
+    # Wait until postgres is healthy before starting ingestion_api
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+
     env_file:
       - ../.env
     environment:
-      # explicit list so expectations are clear + missing vars fail fast
       SDP_ENV: ${SDP_ENV:?SDP_ENV is required}
       DB_DSN: ${DB_DSN:?DB_DSN is required}
       SDP_RATE_LIMIT_PER_MINUTE: ${SDP_RATE_LIMIT_PER_MINUTE:?SDP_RATE_LIMIT_PER_MINUTE is required}
       SDP_CRYPTO_KEY: ${SDP_CRYPTO_KEY:?SDP_CRYPTO_KEY is required}
       SDP_API_KEY: ${SDP_API_KEY:?SDP_API_KEY is required}
+
     ports:
       - "8081:8080"
     restart: unless-stopped
+
+    # API exposes /health, not /readyz
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import sys,requests; sys.exit(0 if requests.get('http://localhost:8080/health',timeout=2).status_code==200 else 1)\""
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 volumes:
   postgres_data:
