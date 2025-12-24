@@ -3,6 +3,7 @@
 *.env
 .env
 .env.*
+!.env.example
 
 # Local DB / vault
 token_vault.db
@@ -28,3 +29,5 @@ Thumbs.db
 
 # Backups
 *.bak
+
+*.egg-info/
