@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.core.crypto import decrypt_value, encrypt_value
 from app.core.rate_limit import FixedWindowRateLimiter
@@ -221,9 +222,29 @@ def _parse_csv_bytes_to_records(csv_bytes: bytes) -> List[Dict[str, Any]]:
 # Health
 # -------------------------
 
-@app.get("/health")
-def health_check() -> dict:
+@app.get("/livez")
+def livez() -> dict:
+    return {"status": "alive", "service": "ingestion_api"}
+
+@app.get("/healthz")
+def healthz() -> dict:
     return {"status": "ok", "service": "ingestion_api"}
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "service": "ingestion_api"}
+
+
+@app.get("/readyz")
+def readyz(db: Session = Depends(get_db)) -> dict:
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as e:
+        logger.error(f"readiness_failed reason=db_error error={repr(e)}")
+        raise HTTPException(status_code=503, detail="Not ready")
+    return {"status": "ready", "service": "ingestion_api"}
+
+
 
 # -------------------------
 # Dev-only Token Vault endpoints
