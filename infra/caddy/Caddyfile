@@ -1,0 +1,10 @@
+{
+  debug
+}
+
+https://localhost {
+  tls internal {
+    protocols tls1.3
+  }
+  reverse_proxy ingestion_api:8080
+}

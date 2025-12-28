@@ -22,7 +22,6 @@ services:
       dockerfile: Dockerfile
     container_name: sdp_ingestion_api
 
-    # Wait until postgres is healthy before starting ingestion_api
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,16 +39,32 @@ services:
       - "8081:8080"
     restart: unless-stopped
 
-    # API exposes /health, not /readyz
+    # Readiness probe (checks DB connectivity via /readyz)
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import sys,requests; sys.exit(0 if requests.get('http://localhost:8080/health',timeout=2).status_code==200 else 1)\""
+          "python -c \"import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/readyz',timeout=2).status==200 else 1)\""
         ]
       interval: 10s
       timeout: 3s
       retries: 10
 
+  caddy:
+    image: caddy:2.8.4
+    container_name: sdp_caddy
+    depends_on:
+      ingestion_api:
+        condition: service_healthy
+    ports:
+      - "8443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  caddy_data:
+  caddy_config:
