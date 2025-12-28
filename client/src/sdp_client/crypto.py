@@ -4,6 +4,16 @@ import os
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
+def generate_crypto_key_b64() -> str:
+    """
+    Generate a fresh 32-byte AES-GCM key and return it as URL-safe base64.
+
+    Use this to create SDP_CRYPTO_KEY values for local dev or initial setup.
+    """
+    key = os.urandom(32)  # 256-bit
+    return base64.urlsafe_b64encode(key).decode("ascii")
+
+
 def _get_aesgcm_key() -> bytes:
     """
     Returns a 32-byte (256-bit) key from SDP_CRYPTO_KEY env var.

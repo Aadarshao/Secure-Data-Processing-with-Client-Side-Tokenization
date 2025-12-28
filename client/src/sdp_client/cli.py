@@ -3,23 +3,156 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import requests
 
-from .tokenization import tokenize_csv, tokenize_csv_with_config
 from .config import load_tokenization_config
-from .transfer import upload_batch
-from .results_client import fetch_results
 from .integration import integrate_results_with_raw_csv
+from .results_client import fetch_results
+from .tokenization import tokenize_csv, tokenize_csv_with_config
+from .transfer import upload_batch
+
+
+def _read_dotenv_file(path: Path) -> dict[str, str]:
+    """
+    Minimal .env parser:
+      - supports KEY=VALUE
+      - strips quotes around VALUE
+      - ignores blank lines and comments
+    """
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+
+        # strip surrounding quotes
+        if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+            v = v[1:-1]
+
+        if k:
+            out[k] = v
+
+    return out
+
+def _find_repo_root(start: Path) -> Path | None:
+    """
+    Walk upward looking for a repo marker.
+    Works no matter where you run the command from.
+    """
+    for p in [start] + list(start.parents):
+        if (p / "infra" / "docker-compose.yml").exists():
+            return p
+        if (p / ".git").exists():
+            return p
+        if (p / ".env").exists():
+            return p
+    return None
+
+
+def _find_client_dir(repo_root: Path) -> Path | None:
+    """
+    Find the client directory under repo root.
+    """
+    candidate = repo_root / "client"
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return None
+
+
+def _try_load_dotenv_files() -> None:
+    """
+    Loads env vars from:
+      1) repo root .env
+      2) client/.env
+
+    Priority (lowest -> highest):
+      - repo root .env
+      - client/.env
+
+    Already-set environment variables are NOT overridden.
+    """
+    here = Path(__file__).resolve()
+    repo_root = _find_repo_root(here.parent)
+
+    # If we can't find repo root, do nothing (but don't crash).
+    if not repo_root:
+        return
+
+    client_dir = _find_client_dir(repo_root)
+
+    repo_env = repo_root / ".env"
+    client_env = (client_dir / ".env") if client_dir else None
+
+    # Load root first (low priority), then client (high priority)
+    for env_path in [repo_env, client_env]:
+        if not env_path or not env_path.exists():
+            continue
+        values = _read_dotenv_file(env_path)
+        for k, v in values.items():
+            os.environ.setdefault(k, v)
+
+
+def _try_load_dotenv_files() -> None:
+    """
+    Loads env vars from:
+      - repo root .env
+      - client/.env
+
+    Priority (lowest -> highest):
+      - repo root .env
+      - client/.env
+
+    Already-set environment variables are NOT overridden.
+    """
+    # This file is: client/src/sdp_client/cli.py
+    client_dir = Path(__file__).resolve().parents[2]  # client/
+    repo_root = client_dir.parent  # repo root
+
+    repo_env = repo_root / ".env"
+    client_env = client_dir / ".env"
+
+    for env_path in (repo_env, client_env):
+        values = _read_dotenv_file(env_path)
+        for k, v in values.items():
+            os.environ.setdefault(k, v)
+
+
+def _die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
 
 
 def _resolve_tls_verify(args) -> bool | str:
+    """
+    requests 'verify' resolution order:
+      1) --ca-bundle
+      2) SDP_CA_BUNDLE env var (recommended)
+      3) --insecure-skip-verify -> False
+      4) default True (requests will also honor REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE)
+    """
     if getattr(args, "ca_bundle", None):
         return args.ca_bundle
+
+    env_ca = os.getenv("SDP_CA_BUNDLE")
+    if env_ca:
+        return env_ca
+
     if getattr(args, "insecure_skip_verify", False):
         return False
+
     return True
 
 
@@ -27,7 +160,7 @@ def _wait_for_processed(
     *,
     batch_id: str,
     client_id: str,
-    server_url: str | None,
+    server_url: str,
     verify_tls: bool | str,
     api_key: str | None,
     wait_timeout_seconds: int,
@@ -125,11 +258,14 @@ def _dev_process_batch(*, batch_id: str, server_url: str, verify_tls: bool | str
 
 
 def main() -> None:
+    _try_load_dotenv_files()
+
+    default_server_url = os.getenv("SDP_SERVER_URL", "https://localhost:8443")
+
     parser = argparse.ArgumentParser(
         prog="sdp-client",
         description="SDP Client – Tokenization & Transfer Tools",
     )
-
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- tokenize-csv ---
@@ -145,7 +281,7 @@ def main() -> None:
         "--token-type",
         default="HASH",
         choices=["HASH", "FPE", "MASKED", "RANDOM"],
-        help="Token type (currently only HASH semantics implemented)",
+        help="Token type (FPE is currently a stub)",
     )
 
     # --- tokenize-config ---
@@ -165,21 +301,21 @@ def main() -> None:
     upload_parser.add_argument("--file", "-f", required=True, help="Path to tokenized CSV file")
     upload_parser.add_argument("--client-id", required=True, help="Client identifier (e.g., bank_demo)")
     upload_parser.add_argument("--processing-type", required=True, help="Processing type (e.g., risk_scoring)")
-    upload_parser.add_argument("--server-url", help="Base URL of ingestion API (default: http://localhost:8081)")
+    upload_parser.add_argument("--server-url", default=default_server_url)
     upload_parser.add_argument("--insecure-skip-verify", action="store_true")
-    upload_parser.add_argument("--ca-bundle", help="Path to custom CA bundle to verify TLS (e.g. ca.pem)")
-    upload_parser.add_argument("--batch-id", help="Optional batch_id to reuse across uploads (must be a UUID)")
-    upload_parser.add_argument("--api-key", help="API key for authenticating (or set SDP_API_KEY env var)")
+    upload_parser.add_argument("--ca-bundle", help="Path to custom CA bundle (PEM)")
+    upload_parser.add_argument("--batch-id", help="Optional batch_id to reuse across uploads (UUID)")
+    upload_parser.add_argument("--api-key", help="API key (or set SDP_API_KEY env var)")
 
     # --- fetch-results ---
     fetch_parser = subparsers.add_parser(
         "fetch-results",
         help="Fetch results for a batch and write raw JSON to a file",
     )
-    fetch_parser.add_argument("--batch-id", required=True, help="Batch ID to fetch results for")
-    fetch_parser.add_argument("--client-id", required=True, help="Client identifier (must match upload-batch)")
-    fetch_parser.add_argument("--output", "-o", required=True, help="Path to output JSON file")
-    fetch_parser.add_argument("--server-url", help="Base URL of ingestion/results API (default: http://localhost:8081)")
+    fetch_parser.add_argument("--batch-id", required=True)
+    fetch_parser.add_argument("--client-id", required=True)
+    fetch_parser.add_argument("--output", "-o", required=True)
+    fetch_parser.add_argument("--server-url", default=default_server_url)
     fetch_parser.add_argument("--insecure-skip-verify", action="store_true")
     fetch_parser.add_argument("--ca-bundle")
     fetch_parser.add_argument("--api-key", help="API key (or set SDP_API_KEY env var)")
@@ -194,7 +330,7 @@ def main() -> None:
     integrate_parser.add_argument("--raw-input", "-i", required=True)
     integrate_parser.add_argument("--output", "-o", required=True)
     integrate_parser.add_argument("--key-column", default="customer_id")
-    integrate_parser.add_argument("--server-url")
+    integrate_parser.add_argument("--server-url", default=default_server_url)
     integrate_parser.add_argument("--insecure-skip-verify", action="store_true")
     integrate_parser.add_argument("--ca-bundle")
     integrate_parser.add_argument("--api-key")
@@ -205,9 +341,8 @@ def main() -> None:
     # --- process-batch ---
     proc_parser = subparsers.add_parser(
         "process-batch",
-        help="Upload -> Process -> Wait -> Integrate results into raw CSV (raw PII stays local)",
+        help="Upload -> Process -> Wait -> Integrate results into raw CSV",
     )
-
     proc_parser.add_argument("--raw-input", required=True)
     proc_parser.add_argument("--output", required=True)
     proc_parser.add_argument("--key-column", default="customer_id")
@@ -220,14 +355,12 @@ def main() -> None:
 
     proc_parser.add_argument("--client-id", required=True)
     proc_parser.add_argument("--processing-type", required=True)
-    proc_parser.add_argument("--server-url", default="http://localhost:8081")
+    proc_parser.add_argument("--server-url", default=default_server_url)
     proc_parser.add_argument("--batch-id")
     proc_parser.add_argument("--api-key")
 
-    # Optional dev processor (no Spark)
-    proc_parser.add_argument("--use-dev-processor", action="store_true", help="Use /dev/process-batch instead of Spark (DEV ONLY)")
+    proc_parser.add_argument("--use-dev-processor", action="store_true")
 
-    # Spark options (only used if not --use-dev-processor)
     proc_parser.add_argument("--spark-image", default="apache/spark:3.5.1")
     proc_parser.add_argument("--spark-network", default="infra_default")
     proc_parser.add_argument("--jobs-mount", required=True)
@@ -248,79 +381,51 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "tokenize-csv":
-        tokenize_csv(
-            input_path=args.input,
-            output_path=args.output,
-            source_table=args.source_table,
-            column_name=args.column,
-            token_type=args.token_type,
-        )
-        print(f"Tokenized CSV written to: {Path(args.output).resolve()}")
-        print("Local Token Vault updated (SQLite: token_vault.db).")
-        return
+    try:
+        if args.command == "tokenize-csv":
+            tokenize_csv(
+                input_path=args.input,
+                output_path=args.output,
+                source_table=args.source_table,
+                column_name=args.column,
+                token_type=args.token_type,
+            )
+            print(f"Tokenized CSV written to: {Path(args.output).resolve()}")
+            print("Local Token Vault updated (SQLite: token_vault.db).")
+            return
 
-    if args.command == "tokenize-config":
-        cfg = load_tokenization_config(args.config)
-        tokenize_csv_with_config(
-            input_path=args.input,
-            output_path=args.output,
-            config=cfg,
-        )
-        print(f"Tokenized CSV written to: {Path(args.output).resolve()}")
-        print(f"Local Token Vault updated (SQLite: token_vault.db) for source_table='{cfg.source_table}'.")
-        return
+        if args.command == "tokenize-config":
+            cfg = load_tokenization_config(args.config)
+            tokenize_csv_with_config(
+                input_path=args.input,
+                output_path=args.output,
+                config=cfg,
+            )
+            print(f"Tokenized CSV written to: {Path(args.output).resolve()}")
+            print(f"Local Token Vault updated (SQLite: token_vault.db) for source_table='{cfg.source_table}'.")
+            return
 
-    if args.command == "upload-batch":
-        verify = _resolve_tls_verify(args)
-        api_key = args.api_key or os.getenv("SDP_API_KEY")
+        if args.command == "upload-batch":
+            verify = _resolve_tls_verify(args)
+            api_key = args.api_key or os.getenv("SDP_API_KEY")
 
-        result = upload_batch(
-            file_path=args.file,
-            client_id=args.client_id,
-            processing_type=args.processing_type,
-            server_url=args.server_url,
-            batch_id=args.batch_id,
-            verify_tls=verify,
-            api_key=api_key,
-        )
-        print("Server response:")
-        print(result)
-        return
-
-    if args.command == "fetch-results":
-        verify = _resolve_tls_verify(args)
-        api_key = args.api_key or os.getenv("SDP_API_KEY")
-
-        results = fetch_results(
-            batch_id=args.batch_id,
-            client_id=args.client_id,
-            server_url=args.server_url,
-            verify_tls=verify,
-            api_key=api_key,
-        )
-
-        out_path = Path(args.output).resolve()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-        print(f"Results JSON written to: {out_path}")
-        return
-
-    if args.command == "integrate-results":
-        verify = _resolve_tls_verify(args)
-        api_key = args.api_key or os.getenv("SDP_API_KEY")
-
-        if args.wait:
-            results = _wait_for_processed(
-                batch_id=args.batch_id,
+            result = upload_batch(
+                file_path=args.file,
                 client_id=args.client_id,
+                processing_type=args.processing_type,
                 server_url=args.server_url,
+                batch_id=args.batch_id,
                 verify_tls=verify,
                 api_key=api_key,
-                wait_timeout_seconds=args.wait_timeout_seconds,
-                poll_interval_seconds=args.poll_interval_seconds,
             )
-        else:
+            print("Server response:")
+            print(result)
+            return
+
+        if args.command == "fetch-results":
+            verify = _resolve_tls_verify(args)
+            api_key = args.api_key or os.getenv("SDP_API_KEY")
+
             results = fetch_results(
                 batch_id=args.batch_id,
                 client_id=args.client_id,
@@ -329,105 +434,136 @@ def main() -> None:
                 api_key=api_key,
             )
 
-        integrate_results_with_raw_csv(
-            raw_input_path=args.raw_input,
-            output_path=args.output,
-            results=results,
-            key_column=args.key_column,
-        )
-        print(f"Integrated results written to: {Path(args.output).resolve()}")
-        return
+            out_path = Path(args.output).resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            print(f"Results JSON written to: {out_path}")
+            return
 
-    if args.command == "process-batch":
-        verify = _resolve_tls_verify(args)
-        api_key = args.api_key or os.getenv("SDP_API_KEY")
+        if args.command == "integrate-results":
+            verify = _resolve_tls_verify(args)
+            api_key = args.api_key or os.getenv("SDP_API_KEY")
 
-        raw_input = Path(args.raw_input).resolve()
-        output_csv = Path(args.output).resolve()
-
-        # 1) Determine tokenized file
-        if args.tokenized_file:
-            tokenized_path = Path(args.tokenized_file).resolve()
-        else:
-            if not args.tokenize_column:
-                raise RuntimeError("You must provide either --tokenized-file OR --tokenize-column.")
-
-            if args.tokenized_output:
-                tokenized_path = Path(args.tokenized_output).resolve()
+            if args.wait:
+                results = _wait_for_processed(
+                    batch_id=args.batch_id,
+                    client_id=args.client_id,
+                    server_url=args.server_url,
+                    verify_tls=verify,
+                    api_key=api_key,
+                    wait_timeout_seconds=args.wait_timeout_seconds,
+                    poll_interval_seconds=args.poll_interval_seconds,
+                )
             else:
-                tokenized_path = output_csv.with_suffix(".tokenized.csv")
+                results = fetch_results(
+                    batch_id=args.batch_id,
+                    client_id=args.client_id,
+                    server_url=args.server_url,
+                    verify_tls=verify,
+                    api_key=api_key,
+                )
 
-            tokenize_csv(
-                input_path=str(raw_input),
-                output_path=str(tokenized_path),
-                source_table=args.source_table,
-                column_name=args.tokenize_column,
-                token_type=args.token_type,
+            integrate_results_with_raw_csv(
+                raw_input_path=args.raw_input,
+                output_path=args.output,
+                results=results,
+                key_column=args.key_column,
             )
-            print(f"Tokenized CSV written to: {tokenized_path}")
-            print("Local Token Vault updated (SQLite: token_vault.db).")
+            print(f"Integrated results written to: {Path(args.output).resolve()}")
+            return
 
-        # 2) Upload batch (multipart to /api/v1/process-file)
-        upload_resp = upload_batch(
-            file_path=str(tokenized_path),
-            client_id=args.client_id,
-            processing_type=args.processing_type,
-            server_url=args.server_url,
-            batch_id=args.batch_id,
-            verify_tls=verify,
-            api_key=api_key,
-        )
+        if args.command == "process-batch":
+            verify = _resolve_tls_verify(args)
+            api_key = args.api_key or os.getenv("SDP_API_KEY")
+            server_url = args.server_url
 
-        batch_id = upload_resp.get("batch_id") or upload_resp.get("batchId") or upload_resp.get("id")
-        if not batch_id:
-            raise RuntimeError(f"Upload response did not include batch_id. Response: {upload_resp}")
+            raw_input = Path(args.raw_input).resolve()
+            output_csv = Path(args.output).resolve()
 
-        print(f"\nBatch uploaded. batch_id={batch_id}\n")
+            if args.tokenized_file:
+                tokenized_path = Path(args.tokenized_file).resolve()
+            else:
+                if not args.tokenize_column:
+                    _die("You must provide either --tokenized-file OR --tokenize-column.", 2)
 
-        # 3) Process (dev or spark)
-        if args.use_dev_processor:
-            _dev_process_batch(batch_id=batch_id, server_url=args.server_url, verify_tls=verify, api_key=api_key)
-        else:
-            jobs_mount = str(Path(args.jobs_mount).resolve())
-            _run_spark_docker_job(
-                batch_id=batch_id,
+                tokenized_path = (
+                    Path(args.tokenized_output).resolve()
+                    if args.tokenized_output
+                    else output_csv.with_suffix(".tokenized.csv")
+                )
+
+                tokenize_csv(
+                    input_path=str(raw_input),
+                    output_path=str(tokenized_path),
+                    source_table=args.source_table,
+                    column_name=args.tokenize_column,
+                    token_type=args.token_type,
+                )
+                print(f"Tokenized CSV written to: {tokenized_path}")
+                print("Local Token Vault updated (SQLite: token_vault.db).")
+
+            upload_resp = upload_batch(
+                file_path=str(tokenized_path),
                 client_id=args.client_id,
                 processing_type=args.processing_type,
-                db_url=args.db_url,
-                db_user=args.db_user,
-                db_password=args.db_password,
-                spark_image=args.spark_image,
-                jobs_mount=jobs_mount,
-                network=args.spark_network,
-                spark_script_path_in_container=args.spark_script,
-                postgres_jar_path_in_container=args.postgres_jar,
-                spark_args=list(args.spark_args or []),
+                server_url=server_url,
+                batch_id=args.batch_id,
+                verify_tls=verify,
+                api_key=api_key,
             )
 
-        # 4) Wait for PROCESSED
-        results = _wait_for_processed(
-            batch_id=batch_id,
-            client_id=args.client_id,
-            server_url=args.server_url,
-            verify_tls=verify,
-            api_key=api_key,
-            wait_timeout_seconds=args.wait_timeout_seconds,
-            poll_interval_seconds=args.poll_interval_seconds,
-        )
+            batch_id = upload_resp.get("batch_id") or upload_resp.get("batchId") or upload_resp.get("id")
+            if not batch_id:
+                _die(f"Upload response did not include batch_id. Response: {upload_resp}", 2)
 
-        # 5) Integrate results locally
-        output_csv.parent.mkdir(parents=True, exist_ok=True)
-        integrate_results_with_raw_csv(
-            raw_input_path=str(raw_input),
-            output_path=str(output_csv),
-            results=results,
-            key_column=args.key_column,
-        )
+            print(f"\nBatch uploaded. batch_id={batch_id}\n")
 
-        print(f"✅ Done. Integrated results written to: {output_csv}")
-        return
+            if args.use_dev_processor:
+                _dev_process_batch(batch_id=batch_id, server_url=server_url, verify_tls=verify, api_key=api_key)
+            else:
+                jobs_mount = str(Path(args.jobs_mount).resolve())
+                _run_spark_docker_job(
+                    batch_id=batch_id,
+                    client_id=args.client_id,
+                    processing_type=args.processing_type,
+                    db_url=args.db_url,
+                    db_user=args.db_user,
+                    db_password=args.db_password,
+                    spark_image=args.spark_image,
+                    jobs_mount=jobs_mount,
+                    network=args.spark_network,
+                    spark_script_path_in_container=args.spark_script,
+                    postgres_jar_path_in_container=args.postgres_jar,
+                    spark_args=list(args.spark_args or []),
+                )
 
-    parser.print_help()
+            results = _wait_for_processed(
+                batch_id=batch_id,
+                client_id=args.client_id,
+                server_url=server_url,
+                verify_tls=verify,
+                api_key=api_key,
+                wait_timeout_seconds=args.wait_timeout_seconds,
+                poll_interval_seconds=args.poll_interval_seconds,
+            )
+
+            output_csv.parent.mkdir(parents=True, exist_ok=True)
+            integrate_results_with_raw_csv(
+                raw_input_path=str(raw_input),
+                output_path=str(output_csv),
+                results=results,
+                key_column=args.key_column,
+            )
+
+            print(f"✅ Done. Integrated results written to: {output_csv}")
+            return
+
+        parser.print_help()
+
+    except NotImplementedError as e:
+        _die(f"ERROR: {e}", 2)
+    except Exception as e:
+        _die(f"ERROR: {e}", 1)
 
 
 if __name__ == "__main__":
