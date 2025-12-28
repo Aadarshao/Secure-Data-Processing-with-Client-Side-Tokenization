@@ -8,9 +8,9 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 from app.core.crypto import decrypt_value, encrypt_value
 from app.core.rate_limit import FixedWindowRateLimiter
@@ -35,6 +35,18 @@ if not logger.handlers:
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | ingestion_api | %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+# -------------------------
+# Dev guardrail
+# -------------------------
+
+def _require_dev() -> None:
+    """
+    Guardrail: /dev/* endpoints should only exist when SDP_ENV=dev.
+    Return 404 to avoid advertising dev endpoints in prod.
+    """
+    if os.getenv("SDP_ENV", "dev").lower() != "dev":
+        raise HTTPException(status_code=404, detail="Not found")
 
 # -------------------------
 # Rate Limiter
@@ -203,11 +215,11 @@ def _extract_record_key(record: Dict[str, Any]) -> str:
 
 def _parse_csv_bytes_to_records(csv_bytes: bytes) -> List[Dict[str, Any]]:
     try:
-        text = csv_bytes.decode("utf-8-sig")
+        text_data = csv_bytes.decode("utf-8-sig")
     except Exception:
         raise HTTPException(status_code=422, detail="CSV must be UTF-8 encoded")
 
-    f = io.StringIO(text)
+    f = io.StringIO(text_data)
     reader = csv.DictReader(f)
 
     if not reader.fieldnames:
@@ -226,9 +238,11 @@ def _parse_csv_bytes_to_records(csv_bytes: bytes) -> List[Dict[str, Any]]:
 def livez() -> dict:
     return {"status": "alive", "service": "ingestion_api"}
 
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok", "service": "ingestion_api"}
+
 
 @app.get("/health")
 def health() -> dict:
@@ -243,8 +257,6 @@ def readyz(db: Session = Depends(get_db)) -> dict:
         logger.error(f"readiness_failed reason=db_error error={repr(e)}")
         raise HTTPException(status_code=503, detail="Not ready")
     return {"status": "ready", "service": "ingestion_api"}
-
-
 
 # -------------------------
 # Dev-only Token Vault endpoints
@@ -265,6 +277,8 @@ def create_token_record(
     db: Session = Depends(get_db),
     ctx: ClientContext = Depends(require_client_context),
 ) -> dict:
+    _require_dev()
+
     encrypted = encrypt_value(payload.original_value)
 
     record = TokenVault(
@@ -291,6 +305,8 @@ def get_original_by_token(
     db: Session = Depends(get_db),
     ctx: ClientContext = Depends(require_client_context),
 ) -> dict:
+    _require_dev()
+
     record = (
         db.query(TokenVault)
         .filter(TokenVault.token_value == token_value)
@@ -444,6 +460,8 @@ def dev_process_batch(
     client_id: Optional[str] = Query(default=None),
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ) -> DevProcessResponse:
+    _require_dev()
+
     batch = db.query(ProcessingBatch).filter(ProcessingBatch.batch_id == batch_id).first()
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")

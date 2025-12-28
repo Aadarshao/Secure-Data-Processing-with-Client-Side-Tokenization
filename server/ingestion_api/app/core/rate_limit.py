@@ -16,7 +16,7 @@ class FixedWindowRateLimiter:
     """
     Simple in-memory fixed-window rate limiter.
 
-    - Keys are arbitrary strings (we will use: f"{client_id}:{action}")
+    - Keys are arbitrary strings (we use f"{client_id}:{action}")
     - Not distributed-safe (OK for dev). Replace with Redis for production.
     """
 
@@ -32,14 +32,16 @@ class FixedWindowRateLimiter:
         # key -> (window_start_epoch, count)
         self._buckets: Dict[str, Tuple[int, int]] = {}
         self._lock = Lock()
-
-        # lightweight cleanup trigger
         self._ops = 0
 
-    def check(self, key: str) -> RateLimitState:
+    def check(self, key: str, cost: int = 1) -> RateLimitState:
         """
         Returns RateLimitState with allowed/remaining/reset info.
+        cost allows weighting requests (default 1).
         """
+        if cost <= 0:
+            cost = 1
+
         now = int(time.time())
         window_start = now - (now % self.window_seconds)
         reset_epoch = window_start + self.window_seconds
@@ -49,53 +51,28 @@ class FixedWindowRateLimiter:
 
             prev = self._buckets.get(key)
             if prev is None:
-                # first request in this window
-                self._buckets[key] = (window_start, 1)
-                remaining = self.limit - 1
-                return RateLimitState(
-                    allowed=True,
-                    limit=self.limit,
-                    remaining=max(0, remaining),
-                    reset_epoch=reset_epoch,
-                )
+                self._buckets[key] = (window_start, cost)
+                remaining = self.limit - cost
+                return RateLimitState(True, self.limit, max(0, remaining), reset_epoch)
 
             prev_window_start, count = prev
             if prev_window_start != window_start:
-                # new window
-                self._buckets[key] = (window_start, 1)
-                remaining = self.limit - 1
-                return RateLimitState(
-                    allowed=True,
-                    limit=self.limit,
-                    remaining=max(0, remaining),
-                    reset_epoch=reset_epoch,
-                )
+                self._buckets[key] = (window_start, cost)
+                remaining = self.limit - cost
+                return RateLimitState(True, self.limit, max(0, remaining), reset_epoch)
 
-            # same window
-            if count >= self.limit:
-                return RateLimitState(
-                    allowed=False,
-                    limit=self.limit,
-                    remaining=0,
-                    reset_epoch=reset_epoch,
-                )
+            if count + cost > self.limit:
+                return RateLimitState(False, self.limit, 0, reset_epoch)
 
-            new_count = count + 1
+            new_count = count + cost
             self._buckets[key] = (window_start, new_count)
             remaining = self.limit - new_count
-            return RateLimitState(
-                allowed=True,
-                limit=self.limit,
-                remaining=max(0, remaining),
-                reset_epoch=reset_epoch,
-            )
+            return RateLimitState(True, self.limit, max(0, remaining), reset_epoch)
 
     def maybe_cleanup(self, max_buckets: int = 50_000) -> None:
         """
         Best-effort cleanup to avoid unbounded growth in long-running dev sessions.
-        Called optionally from the app after requests.
         """
-        # Only attempt cleanup occasionally
         if self._ops % 1000 != 0:
             return
 
@@ -104,11 +81,7 @@ class FixedWindowRateLimiter:
                 return
 
             now = int(time.time())
-            cutoff = now - (2 * self.window_seconds)  # keep last ~2 windows
-            keys_to_delete = []
-            for k, (ws, _) in self._buckets.items():
-                if ws < cutoff:
-                    keys_to_delete.append(k)
-
+            cutoff = now - (2 * self.window_seconds)
+            keys_to_delete = [k for k, (ws, _) in self._buckets.items() if ws < cutoff]
             for k in keys_to_delete:
                 self._buckets.pop(k, None)
