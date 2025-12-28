@@ -1,42 +1,80 @@
 # Secure Data Pipeline (SDP)
 
-## Overview
+## 1. Executive Summary
 
-The Secure Data Pipeline (SDP) provides a full workflow for processing sensitive customer data without ever exposing Personally Identifiable Information (PII) to your server.
+### 1.1 Product Overview
+Secure Data Processor (SDP) is a secure data processing workflow that enables analytics on sensitive customer datasets while keeping Personally Identifiable Information (PII) under client control.
 
-Data is tokenized locally, uploaded securely, processed server-side, and finally reintegrated locally with the original raw data.
-
-### Key Features
-
-* PII never leaves the client machine
-* Encrypted token vault stored locally
-* API-authenticated ingestion
-* Reversible and non-reversible tokens supported
-* Dockerized server + PostgreSQL backend
+**PII is tokenized locally (client-side)**, only **tokenized data** is uploaded to the server for processing, and results are fetched back and **reintegrated locally** with the original raw dataset.
 
 ---
 
-## End-to-End Workflow
+### 1.2 Problem Statement
+Organizations face increasing regulatory pressure (GDPR, CCPA, HIPAA) that restricts movement of PII across boundaries. Many existing approaches either:
 
-1.  End-to-End Tokenization
-2.  Secure Upload
-3.  Server Ingestion
-4.  Analytics
-5.  Local Reintegration
+1. Require centralizing raw PII in a server environment  
+2. Use insecure data transfer patterns  
+3. Do not support round-trip workflows (process results and re-join with local PII)
 
-### System Architecture
+SDP demonstrates a practical and compliant solution:
+
+- **PII never leaves the client machine**
+- Servers process only **tokenized representations**
+- Results are merged **locally** with the original dataset
+
+---
+
+## 2. Key Features
+
+- ✅ Client-side tokenization (PII stays local)
+- ✅ Encrypted local token vault (SQLite + AES-GCM)
+- ✅ API key authenticated ingestion (`X-API-Key`)
+- ✅ Supported token types:
+  - **HASH** (deterministic; referential integrity)
+  - **MASKED** (non-reversible, shape-preserving)
+  - **RANDOM** (non-deterministic; anonymization)
+  - **FPE** (stub / future work)
+- ✅ TLS support (Caddy reverse proxy + local CA bundle)
+- ✅ Dockerized server with PostgreSQL persistence
+- ✅ End-to-end pipeline: upload → process → fetch → integrate locally
+
+> **Note:** Kubernetes is intentionally not used. Docker Compose is the intended deployment method.
+
+---
+
+## 3. System Architecture
+
+### 3.1 Data Flow (Outbound + Inbound)
+
+#### Flow 1: Outbound Processing
+1. Extract: Client loads raw CSV containing PII  
+2. Tokenize: PII fields are converted to tokens locally  
+3. Package: Tokenized CSV is generated  
+4. Transfer: Tokenized CSV is uploaded over TLS  
+5. Process: Server runs analytics on tokenized data  
+6. Store: Results stored server-side by `batch_id` and `client_id`
+
+#### Flow 2: Inbound Results
+1. Receive: Client fetches results using `batch_id`  
+2. Integrate: Results joined with raw CSV locally  
+3. Output: Final merged dataset written to disk  
+
+---
+
+### 3.2 Architecture Diagram
 
 ```mermaid
 flowchart TD
     A["Raw CSV (PII)"]
-    B["Local Tokenization"]
-    C["Tokenized CSV"]
-    D["Secure Upload"]
-    E["Ingestion API"]
-    F["Token Vault"]
-    G["Processing Engine"]
+    B["Local Tokenization (Client)"]
+    C["Tokenized CSV (No PII)"]
+    D["TLS Upload + API Key"]
+    E["Ingestion API (FastAPI)"]
+    F["PostgreSQL (Tokenized Data + Batches)"]
+    G["Processing Engine (Dev Processor / Spark)"]
     H["Results API"]
-    I["Local Reintegration"]
+    I["Client Fetch + Local Integration"]
+    J["Merged Output CSV (PII + Scores)"]
 
     A --> B
     B --> C
@@ -46,244 +84,202 @@ flowchart TD
     E --> G
     G --> H
     H --> I
-
+    I --> J
+ ```   
+## 4. Repository Structure
+text
 ```
-
-
-
-
------
-
-## 1\. Client Components
-
-**Location:** `client/sdp_client/`
-
-### 1.1 Tokenization
-
-#### A. Tokenize via Command Line
-
-Tokenize a CSV by specifying a single column:
-
-```bash
-python -m sdp_client.cli tokenize-csv \
-  --input data/customers_raw.csv \
-  --output data/customers_tokenized.csv \
-  --source-table customers \
-  --column email
+client/                 # Client-side tokenization + CLI
+server/ingestion_api/   # FastAPI ingestion + results APIs
+infra/                  # Docker Compose stack + Caddy TLS proxy
 ```
+## 5. Quickstart (End-to-End Demo)
+### 5.1 Start Infrastructure (Docker)
+From the repository root:
 
-#### B. Tokenize via YAML Config
-
-Define all tokenization rules in a YAML file (e.g., `configs/customers_tokenization.yml`).
-
-```bash
-python -m sdp_client.cli tokenize-config \
-  --config configs/customers_tokenization.yml \
-  --input data/customers_raw.csv \
-  --output data/customers_tokenized_from_cfg.csv
+bash
 ```
-
-**Functionality:**
-
-  * Generates a tokenized non-PII CSV.
-  * Stores encrypted originals in a local SQLite vault: `token_vault.db`.
-  * Uses **AES-GCM** with your crypto key:
-
-<!-- end list -->
-
-```bash
-# Example for Windows (PowerShell)
-$env:SDP_CRYPTO_KEY = "Miql-SH11OTpm4rFOh5QF7iNG2fPolSwwvvb1YceREw="
+docker compose --env-file .env -f infra/docker-compose.yml up -d --build --force-recreate
 ```
+Expected containers:
 
-### 1.2 Upload Batch to Server
+sdp_postgres – PostgreSQL
 
-Set your API key (required):
+sdp_ingestion_api – FastAPI service
 
-```bash
-# Example for Windows (PowerShell)
-$env:SDP_API_KEY = "dev-secret-api-key"
+sdp_caddy – TLS reverse proxy
+
+### 5.2 Generate Local TLS Root CA Bundle (Windows PowerShell)
+This writes the Caddy root certificate to:
+
+bash
 ```
-
-Upload a batch:
-
-```bash
-python -m sdp_client.cli upload-batch \
-  --file data/customers_tokenized_from_cfg.csv \
-  --client-id bank_demo \
-  --processing-type risk_scoring \
-  --server-url http://localhost:8081
+infra/caddy/pki/caddy-root.crt
 ```
+powershell
+```
+powershell -ExecutionPolicy Bypass -File infra/scripts/gen-local-tls.ps1
+```
+### 5.3 Client Environment Configuration
+Create client/.env:
 
-**Example Server Response:**
+env
+```
+SDP_SERVER_URL=https://localhost:8443
+SDP_CA_BUNDLE=D:\Projects\sdp\infra\caddy\pki\caddy-root.crt
+SDP_API_KEY=dev-secret-api-key
+SDP_CRYPTO_KEY=Miql-SH11OTpm4rFOh5QF7iNG2fPolSwwvvb1YceREw=
+```
+The CLI automatically loads environment variables from both the repo root .env and client/.env.
 
-```json
+### 5.4 Upload Tokenized CSV
+bash
+```
+python -m sdp_client.cli upload-batch `
+  --file "D:\Projects\sdp\data\masked.csv" `
+  --client-id bank_demo `
+  --processing-type risk_scoring
+```
+Example response:
+
+json
+```
 {
-  "batch_id": "a241d5d5-9746-4f28-bbaa-f465a4f9e5f8",
+  "batch_id": "a1180fb1-caea-4893-9219-f429141d0929",
   "accepted_records": 3,
   "status": "RECEIVED"
 }
 ```
-
-### 1.3 Dev Processing (Simulated ML Scoring)
-
-Trigger server-side processing:
-
-```powershell
-$batchId = "YOUR-BATCH-ID"
-
-Invoke-WebRequest `
-  -Uri "http://localhost:8081/dev/process-batch/$batchId" `
-  -Method POST |
-  Select-Object -ExpandProperty Content
+### 5.5 Process Batch (Dev Processor)
+bash
 ```
-
-**Expected Output:**
-
-```json
-{
-  "batch_id": "...",
-  "processed_records": 3,
-  "model_version": "demo_v1",
-  "status": "PROCESSED"
-}
+python -m sdp_client.cli process-batch `
+  --raw-input "D:\Projects\sdp\data\raw.csv" `
+  --output "D:\Projects\sdp\data\customers_with_scores.csv" `
+  --key-column customer_id `
+  --tokenized-file "D:\Projects\sdp\data\masked.csv" `
+  --client-id bank_demo `
+  --processing-type risk_scoring `
+  --use-dev-processor `
+  --jobs-mount "D:\Projects\sdp\jobs" `
+  --db-url "postgresql://sdp:sdp_password@localhost:5432/sdp" `
+  --db-user sdp `
+  --db-password sdp_password
 ```
+This performs:
 
-### 1.4 Retrieve & Integrate Results with Raw CSV
+Upload
 
-Retrieve and merge scores locally:
+Dev-only processing
 
-```bash
-python -m sdp_client.cli integrate-results \
-  --batch-id <batch-id> \
-  --raw-input data/customers_raw.csv \
-  --output data/customers_with_scores.csv \
-  --key-column customer_id \
-  --server-url http://localhost:8081
+Polling until PROCESSED
+
+Local integration into output CSV
+
+## 6. Client Components
+Location: client/src/sdp_client/
+
+### 6.1 Tokenization
+Tokenization occurs entirely on the client and produces:
+
+A tokenized CSV
+
+An encrypted local token vault
+
+A. Tokenize a Single Column
+bash
 ```
-
-**Result:** `customers_with_scores.csv` containing:
-
-  * Raw customer data
-  * Model risk scores
-  * Model version metadata
-
------
-
-## 2\. Server Components
-
-**Location:** `server/ingestion_api/`
-
-### 2.1 Technologies
-
-| Technology | Role |
-| :--- | :--- |
-| **FastAPI** | REST API framework. |
-| **PostgreSQL** | Token vault + batch metadata persistence. |
-| **SQLAlchemy ORM** | Database interaction layer. |
-| **AES-GCM** | Encryption for original values in the vault. |
-| **API Key Auth** | Authentication via `X-API-Key` header. |
-| **Docker** | Containerization environment. |
-
-### 2.2 Key Endpoints
-
-| Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/api/v1/process` | `POST` | Upload a batch of tokenized records. |
-| `/dev/process-batch/{batch_id}` | `POST` | Dev-only simulated ML scoring trigger. |
-| `/api/v1/results/{batch_id}` | `GET` | Return processed scores for a batch. |
-| `/health` | `GET` | Simple service health probe. |
-
------
-
-## 3\. Docker Infrastructure
-
-**Location:** `infra/docker-compose.yml`
-
-### Starting the Full Stack
-
-```bash
-docker compose up -d
+python -m sdp_client.cli tokenize-csv \
+  --input data/raw.csv \
+  --output data/tokenized.csv \
+  --source-table customers \
+  --column email \
+  --token-type HASH
 ```
-
-### Health Check
-
-```bash
-curl http://localhost:8081/health
+B. Tokenize via YAML Configuration
+bash
 ```
-
-**Expected:**
-
-```json
-{"status":"ok","service":"ingestion_api"}
+python -m sdp_client.cli tokenize-config \
+  --config configs/customers_tokenization.yml \
+  --input data/raw.csv \
+  --output data/tokenized_from_cfg.csv
 ```
+### 6.2 Supported Token Types
+Token Type	Description
+HASH	Deterministic SHA-256 token; preserves referential integrity
+MASKED	Non-reversible masking; preserves format (email domain, last-4 digits)
+RANDOM	Non-deterministic anonymized tokens
+FPE	Stub / future implementation
 
------
+## 7. Server Components
+Location: server/ingestion_api/
 
-## 4\. Environment Variables
+### 7.1 Technology Stack
+Technology	Role
+FastAPI	REST API
+PostgreSQL	Persistence for batches and results
+SQLAlchemy	ORM
+AES-GCM	Encryption for token vault
+Docker Compose	Deployment
 
-| Variable | Scope | Description |
-| :--- | :--- | :--- |
-| `SDP_CRYPTO_KEY` | client + server | AES-GCM encryption key. |
-| `SDP_API_KEY` | client + server | API key (header `X-API-Key`). |
-| `DB_DSN` | server | PostgreSQL DSN. |
-| `SDP_ENV` | server | Environment mode (`dev`). |
+### 7.2 Key API Endpoints
+Endpoint	Method	Description
+/api/v1/process	POST	Upload JSON batch
+/api/v1/process-file	POST	Upload tokenized CSV
+/dev/process-batch/{batch_id}	POST	Dev-only simulated processing
+/api/v1/results/{batch_id}	GET	Fetch results
+/health	GET	Liveness probe
+/readyz	GET	Database readiness
 
------
+### 7.3 Dev Endpoint Guardrail
+All /dev/* endpoints:
 
-## 5\. Database Schema
+Are enabled only when SDP_ENV=dev
 
-**Tables:**
+Return 404 Not Found in non-dev environments
 
-  * `token_vault` – Encrypted originals + tokens.
-  * `processing_batch` – Tracking client uploads.
-  * `tokenized_record` – Each uploaded tokenized row.
-  * `processed_result` – Scoring results.
+This prevents accidental exposure of development processing logic in production.
 
------
+## 8. Integration Rules (Result Merge)
+When integrating results into the raw CSV:
 
-## 6\. End-to-End Example (Full Pipeline)
+Join key: --key-column (default: customer_id)
 
-```bash
-# 1) Tokenize
-python -m sdp_client.cli tokenize-config --config configs/customers_tokenization.yml ...
+All merging occurs locally
 
-# 2) Upload tokenized CSV
-python -m sdp_client.cli upload-batch ...
+Missing keys in results → raw rows remain unchanged
 
-# 3) Process (dev)
-Invoke-WebRequest -Uri http://localhost:8081/dev/process-batch/<batchId> -Method POST
+Duplicate keys in raw CSV → all matching rows updated
 
-# 4) Integrate results with raw PII
-python -m sdp_client.cli integrate-results ...
-```
+This behavior is intentional and documented.
 
-**Result:**
+## 9. Environment Variables
+Variable	Scope	Description
+SDP_CRYPTO_KEY	Client	AES-GCM key for local vault
+SDP_API_KEY	Client + Server	API key sent via X-API-Key
+SDP_SERVER_URL	Client	Base ingestion API URL
+SDP_CA_BUNDLE	Client	TLS CA bundle path
+DB_DSN	Server	PostgreSQL DSN
+SDP_ENV	Server	Environment mode (dev recommended)
 
-  * Raw PII stays local
-  * Tokenized data processed securely
-  * Scores merged locally
+## 10. Requirements Compliance Matrix
+Requirement	Priority	Status
+Client-side tokenization	P0	✅
+Secure bi-directional transfer	P0	✅
+Server-side tokenized processing	P0	✅
+Client-side result integration	P0	✅
 
------
+## 11. Future Roadmap
+Proper FPE (FF1 / FF3) backed by KMS or HSM
 
-## 7\. Current Status
+Mutual TLS (client certificates)
 
-This implementation currently provides:
+Chunked / resumable uploads for large datasets
 
-  * Local deterministic & config-driven tokenization
-  * AES-GCM encrypted token vault
-  * Upload client with TLS support
-  * Server ingestion API
-  * Dev-only ML simulator
-  * End-to-end tested integration
+Distributed rate limiting (Redis)
 
------
+Append-only audit stream (Kafka)
 
-## 8\. Future Roadmap
+Observability: metrics, logging, tracing
 
-  * Production ingestion workers 
-  * mTLS between client ↔ server
-  * Advanced ML scoring pipeline
-  * Stream/real-time ingestion
-  * Admin dashboard for batches
-  * Secure key rotation tools
+Real-time ingestion pipeline
